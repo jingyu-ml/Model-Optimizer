@@ -995,7 +995,8 @@ class LocalHessianCalibConfig(_SharedStatesConfig, QuantizeAlgorithmConfig):
 
     This algorithm uses activation information to optimize per-block scales for weight
     quantization. It minimizes the output reconstruction error by weighting the loss
-    with the local Hessian matrix computed from input activations.
+    with the local Hessian matrix computed from input activations. For best calibration
+    fidelity and bounded memory, use ``batch_size=1`` and ``layerwise=True``.
 
     The local Hessian loss for each block is: ``(dw @ H @ dw.T)`` where:
     - ``dw = weight - quantized_weight`` (weight reconstruction error per block)
@@ -1042,6 +1043,13 @@ class LocalHessianCalibConfig(_SharedStatesConfig, QuantizeAlgorithmConfig):
         description="The block size used for computing the local Hessian matrix. "
         "This should match the block size used in the quantization config. "
         "Default is 16 for NVFP4.",
+    )
+
+    act_quant_aware: bool = ModeloptField(
+        default=False,
+        title="Include activation quantization in the scale-search objective.",
+        description="If True, minimize the exact expanded output error for quantized weights "
+        "and activations using H = XqᵀXq and P = Xqᵀ(Xq - X).",
     )
 
     distributed_sync: bool | None = ModeloptField(
@@ -1652,6 +1660,9 @@ NVFP4_W4A4_WEIGHT_MSE_FP8_SWEEP_CFG: dict[str, Any] = _load_quantize_config_dict
 NVFP4_W4A4_WEIGHT_LOCAL_HESSIAN_CFG: dict[str, Any] = _load_quantize_config_dict(
     "configs/ptq/presets/model/nvfp4_w4a4_weight_local_hessian"
 )
+NVFP4_W4A4_WEIGHT_LOCAL_HESSIAN_ACT_AWARE_CFG: dict[str, Any] = _load_quantize_config_dict(
+    "configs/ptq/presets/model/nvfp4_w4a4_weight_local_hessian_act_aware"
+)
 MAMBA_MOE_NVFP4_AGGRESSIVE_CFG: dict[str, Any] = _load_quantize_config_dict(
     "configs/ptq/presets/model/mamba_moe_nvfp4_aggressive"
 )
@@ -1743,6 +1754,7 @@ choices: set[str] = {
     "MAMBA_MOE_FP8_CONSERVATIVE_CFG",
     "MAMBA_MOE_FP8_AGGRESSIVE_CFG",
     "NVFP4_W4A4_WEIGHT_LOCAL_HESSIAN_CFG",
+    "NVFP4_W4A4_WEIGHT_LOCAL_HESSIAN_ACT_AWARE_CFG",
     "NVFP4_W4A4_WEIGHT_MSE_FP8_SWEEP_CFG",
 }
 

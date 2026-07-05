@@ -196,16 +196,18 @@ class NVFP4MSECalibrator(MseCalibrator):
         quant_func: Callable | None = None,
         error_func: Callable | None = None,
         hessian: torch.Tensor | None = None,
+        cross: torch.Tensor | None = None,
     ):
         """Initialize NVFP4 MSE calibrator with per-block and global amax.
 
-        ``hessian`` (per-cin-block ``[cin // block_size, block_size, block_size]``) enables
-        the Hessian-weighted Triton fast path (local_hessian); ``error_func`` carries the
-        same metric for the reference fallback when the fast path is unavailable.
+        ``hessian`` (per-cin-block ``[cin // block_size, block_size, block_size]``) and its
+        optional activation-aware ``cross`` term enable the local-Hessian Triton fast path;
+        ``error_func`` carries the same metric for the reference fallback.
         """
         super().__init__(amax=amax, axis=axis, quant_func=quant_func, error_func=error_func)
         self._global_amax = global_amax.to(dtype=torch.float32)
         self._hessian = hessian
+        self._cross = cross
         # Set by collect() after either sweep path; consumed by compute_amax.
         self._best_amax: torch.Tensor | None = None
 
@@ -265,7 +267,11 @@ class NVFP4MSECalibrator(MseCalibrator):
             from modelopt.torch.kernels.quantization.gemm import nvfp4_fp8_scale_sweep_hessian
 
             best_flat = nvfp4_fp8_scale_sweep_hessian(
-                x.detach(), self._global_amax, self._hessian, block_size=x.shape[-1]
+                x.detach(),
+                self._global_amax,
+                self._hessian,
+                cross=self._cross,
+                block_size=x.shape[-1],
             )
             self._best_amax = best_flat.reshape(self._initial_amax.shape).to(dtype=torch.float32)
             return

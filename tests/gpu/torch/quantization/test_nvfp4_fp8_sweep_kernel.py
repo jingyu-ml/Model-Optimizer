@@ -381,10 +381,12 @@ def test_mse_calibrate_end_to_end(monkeypatch, tmp_path, dtype):
 # --------------------------------------------------------------------------------------
 
 
-def _build_hessian_accumulator(cout, cin, hessian_input, block_size=BLOCK_SIZE):
+def _build_hessian_accumulator(
+    cout, cin, hessian_input, quantized_input=None, block_size=BLOCK_SIZE
+):
     """Real ``_LocalHessianAccumulator`` so the test exercises the production metric."""
     acc = _LocalHessianAccumulator(cout, cin, block_size)
-    acc.accumulate(hessian_input)
+    acc.accumulate(hessian_input, quantized_input)
     return acc
 
 
@@ -411,6 +413,7 @@ def _run_hessian_triton(x_blocks, per_block_amax, global_amax, acc):
             global_amax=global_amax,
             quant_func=_reference_quant_func(global_amax),
             hessian=acc.normalized_hessian(),
+            cross=acc.normalized_cross(),
         )
         cal.collect(x_blocks)
         return cal.compute_amax()
@@ -426,6 +429,18 @@ def _total_hessian_loss(x_blocks, per_block_amax, global_amax, hessian):
     xq = static_blockwise_fp4_fake_quant(x_blocks.float(), per_block_amax, global_amax)
     dw = x_blocks.float() - xq
     return (torch.einsum("nij,nj->ni", h_per_block, dw) * dw).sum()
+
+
+def _activation_aware_loss(x_blocks, per_block_amax, global_amax, hessian, cross):
+    """Per-block activation-aware objective at the selected weight scales."""
+    n_blocks = x_blocks.shape[0]
+    n_cin = hessian.shape[0]
+    cin_idx = torch.arange(n_blocks, device=x_blocks.device) % n_cin
+    xq = static_blockwise_fp4_fake_quant(x_blocks.float(), per_block_amax, global_amax)
+    dw = x_blocks.float() - xq
+    quad = (torch.einsum("nij,nj->ni", hessian[cin_idx], dw) * dw).sum(dim=1)
+    pw = torch.einsum("nij,nj->ni", cross[cin_idx], x_blocks.float())
+    return quad - 2 * (dw * pw).sum(dim=1)
 
 
 @requires_triton
@@ -486,6 +501,35 @@ def test_hessian_parity_random_weights(seed, cout, cin, dtype):
 
 
 @requires_triton
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_activation_aware_hessian_parity(dtype):
+    """Activation-aware Hessian+cross Triton sweep matches the reference objective."""
+    torch.manual_seed(17)
+    cout, cin = 32, 64
+    weight = torch.randn(cout, cin, device="cuda", dtype=dtype)
+    hessian_input = torch.randn(512, cin, device="cuda")
+    # A systematic scale bias makes weight compensation reduce the activation-only error,
+    # deterministically exercising negative values of the constant-dropped objective.
+    quantized_input = (torch.round(hessian_input * 2) / 2) * 1.25
+    acc = _build_hessian_accumulator(cout, cin, hessian_input, quantized_input)
+    x_blocks = weight.reshape(-1, BLOCK_SIZE)
+    per_block_amax = x_blocks.float().abs().amax(dim=-1)
+    global_amax = per_block_amax.max()
+
+    ref = _run_hessian_reference(x_blocks, per_block_amax, global_amax, acc)
+    tri = _run_hessian_triton(x_blocks, per_block_amax, global_amax, acc)
+    n_diff = int((ref != tri).sum())
+    if dtype != torch.bfloat16:
+        assert torch.equal(ref, tri), f"{n_diff}/{ref.numel()} blocks differ"
+    else:
+        assert n_diff / ref.numel() < 1e-3
+    winning_loss = _activation_aware_loss(
+        x_blocks, tri, global_amax, acc.normalized_hessian(), acc.normalized_cross()
+    )
+    assert (winning_loss < 0).any()
+
+
+@requires_triton
 def test_hessian_sweep_input_validation():
     """``nvfp4_fp8_scale_sweep_hessian`` should reject malformed inputs cleanly."""
     device = "cuda"
@@ -501,6 +545,58 @@ def test_hessian_sweep_input_validation():
     # Wrong Hessian block dims.
     with pytest.raises(ValueError, match="hessian must have shape"):
         nvfp4_fp8_scale_sweep_hessian(x, g, torch.randn(4, 8, 8, device=device))
+    with pytest.raises(ValueError, match="cross must have the same shape"):
+        nvfp4_fp8_scale_sweep_hessian(x, g, h, cross=torch.randn(4, 8, 8, device=device))
+
+
+@requires_triton
+def test_activation_aware_local_hessian_end_to_end(monkeypatch):
+    """Activation-aware local-Hessian fast and reference paths select identical amaxes."""
+    if get_cuda_ext_mx() is None:
+        pytest.skip("cuda_ext_mx is not available")
+    cfg = {
+        "quant_cfg": [
+            {
+                "quantizer_name": "*weight_quantizer",
+                "cfg": {
+                    "num_bits": (2, 1),
+                    "block_sizes": {-1: 16, "type": "static", "scale_bits": (4, 3)},
+                    "axis": None,
+                },
+                "enable": True,
+            },
+            {
+                "quantizer_name": "*input_quantizer",
+                "cfg": {
+                    "num_bits": (2, 1),
+                    "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)},
+                },
+                "enable": True,
+            },
+        ],
+        "algorithm": {
+            "method": "local_hessian",
+            "fp8_scale_sweep": True,
+            "act_quant_aware": True,
+        },
+    }
+
+    def _run(env_value):
+        torch.manual_seed(19)
+        model = SimpleLinear().cuda()
+        monkeypatch.setenv("MODELOPT_NVFP4_TRITON_SWEEP", env_value)
+        data = [model.get_input().cuda() for _ in range(2)]
+        mtq.quantize(model, cfg, forward_loop=lambda m: [m(x) for x in data])
+        return {
+            name: module.amax.clone()
+            for name, module in model.named_modules()
+            if isinstance(module, TensorQuantizer) and module.is_nvfp4_static
+        }
+
+    fast = _run("1")
+    reference = _run("0")
+    assert fast.keys() == reference.keys()
+    assert all(torch.equal(fast[name], reference[name]) for name in fast)
 
 
 @requires_triton

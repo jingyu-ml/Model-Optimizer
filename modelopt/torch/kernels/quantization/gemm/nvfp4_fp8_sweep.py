@@ -174,6 +174,7 @@ _HESSIAN_NUM_WARPS = 4
 def _fp8_scale_sweep_hessian_kernel(
     x_ptr,  # [COUT * N_CIN_BLOCKS * BLOCK_SIZE], any float dtype (loaded as fp32)
     hessian_ptr,  # [N_CIN_BLOCKS * BLOCK_SIZE * BLOCK_SIZE] fp32
+    cross_ptr,  # [N_CIN_BLOCKS * BLOCK_SIZE * BLOCK_SIZE] fp32
     candidate_scales_ptr,  # [NUM_CANDIDATES] fp32: per-candidate FP8-quantized block scale
     candidate_amaxes_ptr,  # [NUM_CANDIDATES] fp32: per-candidate block amax (kernel output value)
     best_amax_ptr,  # [COUT * N_CIN_BLOCKS] fp32 output
@@ -182,6 +183,7 @@ def _fp8_scale_sweep_hessian_kernel(
     BLOCK_SIZE: tl.constexpr,
     NUM_CANDIDATES: tl.constexpr,
     ROWS_PER_PROGRAM: tl.constexpr,
+    HAS_CROSS: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     cin_block = pid % N_CIN_BLOCKS
@@ -205,6 +207,14 @@ def _fp8_scale_sweep_hessian_kernel(
         + idx[:, None] * BLOCK_SIZE
         + idx[None, :]
     ).to(tl.float32)  # [BS, BS]
+    if HAS_CROSS:
+        cross_t = tl.load(
+            cross_ptr
+            + cin_block * (BLOCK_SIZE * BLOCK_SIZE)
+            + idx[None, :] * BLOCK_SIZE
+            + idx[:, None]
+        ).to(tl.float32)  # [BS, BS], transposed
+        pw = tl.dot(w, cross_t, allow_tf32=False)  # [ROWS, BS]
 
     best_loss = tl.full([ROWS_PER_PROGRAM], float("inf"), dtype=tl.float32)
     best_idx = tl.zeros([ROWS_PER_PROGRAM], dtype=tl.int32)
@@ -218,6 +228,8 @@ def _fp8_scale_sweep_hessian_kernel(
         # dwᵀ H dw per row (H symmetric); allow_tf32=False keeps it true fp32 vs the reference.
         hdw = tl.dot(dw, hessian, allow_tf32=False)  # [ROWS, BS]
         loss = tl.sum(hdw * dw, axis=1)  # [ROWS]
+        if HAS_CROSS:
+            loss -= 2.0 * tl.sum(dw * pw, axis=1)
         is_better = loss < best_loss
         best_loss = tl.where(is_better, loss, best_loss)
         best_idx = tl.where(is_better, k, best_idx)
@@ -230,12 +242,14 @@ def nvfp4_fp8_scale_sweep_hessian(
     x: torch.Tensor,
     global_amax: torch.Tensor,
     hessian: torch.Tensor,
+    cross: torch.Tensor | None = None,
     block_size: int = 16,
 ) -> torch.Tensor:
     """Find the per-block FP8 scale minimizing the Hessian-weighted NVFP4 quant error.
 
     Hessian-weighted counterpart of :func:`nvfp4_fp8_scale_sweep`: for each NVFP4 block
-    it minimizes ``dwᵀ H dw`` (``dw = w - quant(w)``) over the 126 FP8 E4M3 candidates,
+    it minimizes ``dwᵀ H dw - 2 dwᵀ P w`` (``dw = w - quant(w)``) over the 126 FP8 E4M3
+    candidates,
     where ``H`` is the per-cin-block local Hessian shared across all output rows. Used by
     :class:`NVFP4MSECalibrator` for ``local_hessian`` calibration.
 
@@ -246,6 +260,7 @@ def nvfp4_fp8_scale_sweep_hessian(
         global_amax: Scalar FP32 global amax (``= reduce_amax(per_block_amax)``).
         hessian: Per-cin-block Hessian of shape ``[cin // block_size, block_size, block_size]``,
             fp32 (typically normalized by sample count).
+        cross: Optional activation-aware cross term with the same shape as ``hessian``.
         block_size: NVFP4 block size (typically 16).
 
     Returns:
@@ -258,6 +273,11 @@ def nvfp4_fp8_scale_sweep_hessian(
             f"got {tuple(hessian.shape)}."
         )
     n_cin_blocks = hessian.shape[0]
+    if cross is not None and cross.shape != hessian.shape:
+        raise ValueError(
+            f"cross must have the same shape as hessian {tuple(hessian.shape)}, "
+            f"got {tuple(cross.shape)}."
+        )
     if n_blocks % n_cin_blocks != 0:
         raise ValueError(
             f"n_blocks ({n_blocks}) is not divisible by n_cin_blocks ({n_cin_blocks})."
@@ -274,9 +294,15 @@ def nvfp4_fp8_scale_sweep_hessian(
             candidate_amaxes, global_amax_f32, quantize_block_scales=True
         ).to(dtype=torch.float32)
         hessian_flat = hessian.contiguous().to(device=x.device, dtype=torch.float32).view(-1)
+        cross_flat = (
+            cross.contiguous().to(device=x.device, dtype=torch.float32).view(-1)
+            if cross is not None
+            else hessian_flat
+        )
         _fp8_scale_sweep_hessian_kernel[grid](
             x_flat,
             hessian_flat,
+            cross_flat,
             candidate_scales,
             candidate_amaxes,
             best_amax,
@@ -285,6 +311,7 @@ def nvfp4_fp8_scale_sweep_hessian(
             BLOCK_SIZE=block_size,
             NUM_CANDIDATES=int(candidate_amaxes.numel()),
             ROWS_PER_PROGRAM=_HESSIAN_ROWS_PER_PROGRAM,
+            HAS_CROSS=cross is not None,
             num_warps=_HESSIAN_NUM_WARPS,
         )
     return best_amax

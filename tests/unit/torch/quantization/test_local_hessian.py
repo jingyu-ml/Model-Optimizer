@@ -49,6 +49,15 @@ INT8_WEIGHT_CFG = {
     "algorithm": "max",
 }
 
+INT8_WEIGHT_ACT_CFG = {
+    "quant_cfg": [
+        {"quantizer_name": "*", "enable": False},
+        {"quantizer_name": "*weight_quantizer", "cfg": {"num_bits": 8, "axis": 0}},
+        {"quantizer_name": "*input_quantizer", "cfg": {"num_bits": 8, "axis": None}},
+    ],
+    "algorithm": "max",
+}
+
 
 def _weight_amaxes(model):
     return {
@@ -81,6 +90,56 @@ class TestLocalHessianAccumulator:
         assert acc.num_samples == 15
         assert acc.build_error_func() is not None
         assert acc.hessian_per_block is None  # raw buffer freed
+        assert acc.cross_per_block is None  # default path never allocates the cross term
+
+    def test_activation_aware_accumulator_matches_explicit_einsums(self):
+        torch.manual_seed(2)
+        cin, bs = 32, 16
+        acc = _LocalHessianAccumulator(4, cin, bs)
+        x = torch.randn(7, cin)
+        xq = x + 0.1 * torch.randn_like(x)
+        acc.accumulate(x, xq)
+
+        xb = x.T.reshape(cin // bs, bs, -1)
+        xqb = xq.T.reshape(cin // bs, bs, -1)
+        expected_hessian = torch.einsum("nbt,ndt->nbd", xqb, xqb) / x.shape[0]
+        expected_cross = torch.einsum("nbt,ndt->nbd", xqb, xqb - xb) / x.shape[0]
+        assert torch.allclose(acc.normalized_hessian(), expected_hessian)
+        assert torch.allclose(acc.normalized_cross(), expected_cross)
+
+        assert acc.build_error_func() is not None
+        assert acc.hessian_per_block is None
+        assert acc.cross_per_block is None
+
+    def test_activation_aware_error_matches_exact_objective_and_pins_sign(self):
+        torch.manual_seed(3)
+        tokens, cout, cin = 11, 3, 16
+        x = torch.randn(tokens, cin)
+        xq = x + 0.2 * torch.randn_like(x)
+        w0 = torch.randn(cout, cin)
+        wq = w0 + 0.1 * torch.randn_like(w0)
+        acc = _LocalHessianAccumulator(cout, cin, cin)
+        acc.accumulate(x, xq)
+
+        actual = acc.build_error_func()(w0, wq)[:, 0]
+        full_error = (xq @ wq.T - x @ w0.T).square().sum(dim=0)
+        activation_constant = (xq @ w0.T - x @ w0.T).square().sum(dim=0)
+        expected = (full_error - activation_constant) / tokens
+        assert torch.allclose(actual, expected, atol=1e-5)
+
+    def test_zero_cross_reduces_to_existing_objective(self):
+        torch.manual_seed(4)
+        x = torch.randn(9, 16)
+        w = torch.randn(2, 16)
+        wq = w + 0.1 * torch.randn_like(w)
+        plain = _LocalHessianAccumulator(2, 16, 16)
+        aware = _LocalHessianAccumulator(2, 16, 16)
+        plain.accumulate(x)
+        aware.accumulate(x, x)
+
+        assert torch.count_nonzero(aware.normalized_cross()) == 0
+        assert torch.equal(plain.normalized_hessian(), aware.normalized_hessian())
+        assert torch.equal(plain.build_error_func()(w, wq), aware.build_error_func()(w, wq))
 
     def test_error_func_matches_explicit_hessian_weighted_loss(self):
         torch.manual_seed(1)
@@ -131,6 +190,67 @@ class TestLocalHessianCalibrateDense:
         assert all(torch.isfinite(a).all() and (a > 0).all() for a in lh.values())
         assert any(not torch.allclose(lh[n], max_amax[n]) for n in lh)  # refined past max-cal
         assert any(not torch.allclose(lh[n], mse[n]) for n in lh)  # Hessian changed the choice
+
+    def test_activation_aware_capture_and_disabled_quantizer_degeneracy(self):
+        forward_loop = _make_forward_loop()
+        torch.manual_seed(5)
+        aware_model = SimpleLinear()
+        mtq.quantize(aware_model, INT8_WEIGHT_ACT_CFG, forward_loop=forward_loop)
+        local_hessian_calibrate(
+            aware_model,
+            forward_loop,
+            fp8_scale_sweep=False,
+            act_quant_aware=True,
+            debug=True,
+        )
+        assert any(
+            acc.normalized_cross() is not None
+            for acc in aware_model._local_hessian_accumulators.values()
+        )
+        torch.manual_seed(5)
+        plain_model = SimpleLinear()
+        mtq.quantize(plain_model, INT8_WEIGHT_ACT_CFG, forward_loop=forward_loop)
+        local_hessian_calibrate(plain_model, forward_loop, fp8_scale_sweep=False)
+        aware_amaxes = _weight_amaxes(aware_model)
+        plain_amaxes = _weight_amaxes(plain_model)
+        assert any(
+            not torch.allclose(aware_amaxes[name], plain_amaxes[name]) for name in aware_amaxes
+        )
+
+        def _run_disabled(act_quant_aware):
+            torch.manual_seed(6)
+            model = SimpleLinear()
+            mtq.quantize(model, INT8_WEIGHT_CFG, forward_loop=forward_loop)
+            local_hessian_calibrate(
+                model,
+                forward_loop,
+                fp8_scale_sweep=False,
+                act_quant_aware=act_quant_aware,
+            )
+            return _weight_amaxes(model)
+
+        plain = _run_disabled(False)
+        aware_disabled = _run_disabled(True)
+        assert plain.keys() == aware_disabled.keys()
+        assert all(torch.equal(plain[name], aware_disabled[name]) for name in plain)
+
+    def test_activation_aware_falls_back_for_pre_quant_scale(self):
+        forward_loop = _make_forward_loop()
+        torch.manual_seed(7)
+        model = SimpleLinear()
+        mtq.quantize(model, INT8_WEIGHT_ACT_CFG, forward_loop=forward_loop)
+        linear = model.net[0]
+        linear.input_quantizer.pre_quant_scale = torch.ones(16)
+        with pytest.warns(UserWarning, match="falling back to non-activation-aware capture"):
+            local_hessian_calibrate(
+                model,
+                forward_loop,
+                fp8_scale_sweep=False,
+                act_quant_aware=True,
+                debug=True,
+            )
+        acc = model._local_hessian_accumulators[id(linear.weight_quantizer)]
+        assert acc.normalized_cross() is None
 
     def test_warns_with_module_name_when_cin_not_divisible(self):
         class _OddModel(nn.Module):

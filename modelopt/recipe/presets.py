@@ -75,6 +75,7 @@ QFORMAT_ALIASES: dict[str, str] = {
     "nvfp4_awq": "nvfp4_awq_lite",
     "nvfp4_mse": "nvfp4_w4a4_weight_mse_fp8_sweep",
     "nvfp4_local_hessian": "nvfp4_w4a4_weight_local_hessian",
+    "nvfp4_local_hessian_act_aware": "nvfp4_w4a4_weight_local_hessian_act_aware",
     "fp8_pb_wo": "fp8_2d_blockwise_weight_only",
     "fp8_pc_pt": "fp8_per_channel_per_token",
 }
