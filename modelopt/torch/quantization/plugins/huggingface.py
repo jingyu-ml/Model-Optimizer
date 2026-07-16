@@ -130,13 +130,6 @@ class _QuantAttention(QuantModule):
         if kitchen is not None and self.kitchen_attn_fn is None:
             self._init_kitchen_attn_fn()
 
-        # HF passes per-head 4D tensors in bhsd layout (batch, heads, seq, head_dim):
-        #   query_states: [batch, num_attention_heads, q_seq_len, head_dim]
-        #   key/value_states: [batch, num_key_value_heads, kv_seq_len, head_dim]
-        #     (GQA: num_key_value_heads <= num_attention_heads; kv heads are repeated below.)
-        # Prefill: q_seq_len == kv_seq_len == prompt length (full sequence attends to itself).
-        # Decode:  q_seq_len == 1 while kv_seq_len == cached context length (grows each step);
-        #          detected below via query_states.shape[2] < key_states.shape[2].
         query_states = self.q_bmm_quantizer(query_states)
         key_states = self.k_bmm_quantizer(key_states)
         value_states = self.v_bmm_quantizer(value_states)

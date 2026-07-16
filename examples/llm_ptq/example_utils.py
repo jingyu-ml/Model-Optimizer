@@ -86,7 +86,7 @@ def validate_fsdp2_supported(args, config):
         issues.append("speculative decoding (--specdec_offline_dataset)")
     if getattr(args, "low_memory_mode", False):
         issues.append("--low_memory_mode (redundant with FSDP2)")
-    # MTP is supported (loader drops the head, export re-attaches it BF16), so it is not rejected.
+
     if issues:
         raise NotImplementedError(
             "--use_fsdp2 does not support:\n  - "
@@ -359,31 +359,37 @@ def get_processor(
             return None
 
 
-def _mtp_prefixes_from_keys(keys) -> set[str]:
-    """Exclude-prefixes for MTP weight keys: the top-level module (mtp) and any mtp.layers.N span."""
-    prefixes = set()
-    for key in keys:
-        parts = key.split(".")
-        if parts:
-            prefixes.add(parts[0])
-        for i, part in enumerate(parts):
-            if part == "layers" and i + 1 < len(parts) and parts[i + 1].isdigit():
-                prefixes.add(".".join(parts[: i + 2]))
-                break
-    return prefixes
+def _mtp_weight_map(model_path: str) -> dict[str, list[str]]:
+    """``{safetensors_file: [mtp weight keys]}`` from the checkpoint index (``{}`` if no index / no MTP).
 
-
-def mtp_layer_prefixes_from_checkpoint(model_path: str) -> list[str]:
-    """MTP exclude-prefixes from a checkpoint's safetensors index (``[]`` if none); reads no tensors.
-
-    Local-index-only, matching :func:`load_mtp_weights`, so detection and re-attach stay in sync.
+    Local-index-only; the shared read + ``"mtp"`` filter behind both prefix detection and weight load.
     """
     index_file = Path(model_path) / "model.safetensors.index.json"
     if not index_file.exists():
-        return []
-    weight_map = json.load(open(index_file))["weight_map"]
-    mtp_keys = [k for k, v in weight_map.items() if "mtp" in k or "mtp" in v]
-    return list(_mtp_prefixes_from_keys(mtp_keys))
+        return {}
+    mtp_weight_map: dict[str, list[str]] = {}
+    for k, v in json.load(open(index_file))["weight_map"].items():
+        if "mtp" in k or "mtp" in v:
+            mtp_weight_map.setdefault(v, []).append(k)
+    return mtp_weight_map
+
+
+def mtp_layer_prefixes_from_checkpoint(model_path: str) -> list[str]:
+    """MTP exclude-prefixes (top-level ``mtp`` + ``mtp.layers.N`` spans) from a checkpoint index.
+
+    ``[]`` if no index / no MTP weights; reads no tensors.
+    """
+    prefixes = set()
+    for keys in _mtp_weight_map(model_path).values():
+        for key in keys:
+            parts = key.split(".")
+            if parts:
+                prefixes.add(parts[0])
+            for i, part in enumerate(parts):
+                if part == "layers" and i + 1 < len(parts) and parts[i + 1].isdigit():
+                    prefixes.add(".".join(parts[: i + 2]))
+                    break
+    return list(prefixes)
 
 
 def load_mtp_weights(
@@ -408,26 +414,11 @@ def load_mtp_weights(
         Dictionary of MTP weights that were not loaded into the model state dict.
     """
     model_path = Path(model_path)
-    index_file = model_path / "model.safetensors.index.json"
-
-    if not index_file.exists():
-        return [], {}
-
-    # Load the index to find all referenced safetensors files
-    index = json.load(open(index_file))
-    weight_map = index["weight_map"]
-    # Find all files in weight_map whose key or value contains "mtp"
-    mtp_weight_map = {}
-    for k, v in weight_map.items():
-        if "mtp" in k or "mtp" in v:
-            mtp_weight_map.setdefault(v, []).append(k)
-
+    mtp_weight_map = _mtp_weight_map(str(model_path))
     if not mtp_weight_map:
         return [], {}
 
-    # Flatten mtp_weight_map.values() (list of list of str) to a single list of str
-    mtp_keys = [k for keys in mtp_weight_map.values() for k in keys]
-    mtp_layer_prefixes = _mtp_prefixes_from_keys(mtp_keys)
+    mtp_layer_prefixes = mtp_layer_prefixes_from_checkpoint(str(model_path))
 
     # Check which non-standard files exist and have missing weights
     model_state = model.state_dict()
