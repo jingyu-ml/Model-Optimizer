@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import json
 import subprocess
+from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -706,6 +708,96 @@ def test_submit_job_slurm_parses_nemo_job_id(monkeypatch, tmp_path):
     assert meta["cluster_user"] == "user"
 
 
+def test_submit_job_slurm_creates_mlflow_run_and_injects_env(monkeypatch, tmp_path):
+    """enable_mlflow=True creates a run and passes standard env vars to launcher."""
+    yaml_dir = tmp_path / "examples"
+    yaml_dir.mkdir()
+    yaml_path = yaml_dir / "config.yaml"
+    yaml_path.write_text("job_name: t\npipeline: []\n")
+    monkeypatch.setenv("MODELOPT_LAUNCHER_EXAMPLES_DIR", str(yaml_dir))
+    monkeypatch.setenv("NEMORUN_HOME", str(tmp_path))
+    monkeypatch.setenv("USER", "alice")
+    (tmp_path / "experiments" / "cicd" / "cicd_1782173197").mkdir(parents=True)
+    monkeypatch.setattr(bridge, "verify_slurm_setup_impl", lambda **_: {"ok": True})
+
+    calls = []
+
+    class _Info:
+        run_id = "run-123"
+        experiment_id = "7"
+
+    class _Run:
+        info = _Info()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class _MLflow:
+        def set_tracking_uri(self, uri):
+            calls.append(("tracking_uri", uri))
+
+        def set_experiment(self, name):
+            calls.append(("experiment", name))
+
+        def start_run(self, **kwargs):
+            calls.append(("start_run", kwargs))
+            return _Run()
+
+        def log_params(self, params):
+            calls.append(("params", params))
+
+        def set_tags(self, tags):
+            calls.append(("tags", tags))
+
+    monkeypatch.setattr(bridge, "_setup_mlflow", lambda: (_MLflow(), None))
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["env"] = kwargs["env"]
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=0,
+            stdout=(
+                "Experiment Status for cicd_1782173197\n"
+                "- Job id: 13049989\n"
+                'experiment = run.Experiment.from_id("cicd_1782173197")\n'
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = bridge.submit_job_impl(
+        yaml_path="config.yaml",
+        cluster_host="cluster.example.com",
+        cluster_user="user",
+        skip_verify=False,
+        enable_mlflow=True,
+        mlflow_tracking_uri="https://mlflow.example",
+        mlflow_experiment="mcp-tests",
+    )
+
+    assert result["ok"] is True
+    assert result["mlflow"]["mlflow_run_id"] == "run-123"
+    assert (
+        result["mlflow"]["mlflow_run_url"] == "https://mlflow.example/#/experiments/7/runs/run-123"
+    )
+    assert captured["env"]["MLFLOW_RUN_ID"] == "run-123"
+    assert captured["env"]["MLFLOW_TRACKING_URI"] == "https://mlflow.example"
+    assert ("tracking_uri", "https://mlflow.example") in calls
+    assert ("experiment", "mcp-tests") in calls
+    assert (
+        "start_run",
+        {"run_name": "alice/cluster.example.com/examples/config"},
+    ) in calls
+    tags = next(item[1] for item in calls if item[0] == "tags")
+    assert tags["lifecycle"] == "submitted"
+    assert tags["managed_by"] == "modelopt-mcp"
+
+
 def test_submit_job_slurm_accepts_nmm_cluster_fields(monkeypatch, tmp_path):
     """nmm-sandbox resolved cluster config maps to launcher overrides and env."""
     yaml_dir = tmp_path / "examples"
@@ -1390,6 +1482,173 @@ def test_wait_for_experiment_returns_terminal_immediately(tmp_path, monkeypatch)
     assert result["ok"] is True
     assert result["status"] == "done"
     assert result["waited_seconds"] < 1  # didn't actually wait
+
+
+def test_finalize_mlflow_run_uploads_launcher_logs(tmp_path, monkeypatch):
+    """Finalization logs final status and uploads local launcher artifacts."""
+    exp = tmp_path / "experiments" / "exp_done"
+    exp.mkdir(parents=True)
+    (exp / "_DONE").touch()
+    (exp / "status_task_0.out").write_text("succeeded\n")
+    (exp / "log_task_0.out").write_text("hello from slurm\n")
+    monkeypatch.setenv("NEMORUN_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        bridge,
+        "_fetch_nemo_logs_to_experiment_dir",
+        lambda **kwargs: {"fetched_artifacts": [], "errors": []},
+    )
+
+    calls: list[tuple[Any, ...]] = []
+
+    class _Run:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class _MLflow:
+        def set_tracking_uri(self, uri):
+            calls.append(("tracking_uri", uri))
+
+        def start_run(self, **kwargs):
+            calls.append(("start_run", kwargs))
+            return _Run()
+
+        def log_param(self, key, value):
+            calls.append(("param", key, value))
+
+        def log_metric(self, key, value):
+            calls.append(("metric", key, value))
+
+        def set_tags(self, tags):
+            calls.append(("tags", tags))
+
+        def log_artifact(self, path, artifact_path=None):
+            calls.append(("artifact", path, artifact_path))
+
+    monkeypatch.setattr(bridge, "_setup_mlflow", lambda: (_MLflow(), None))
+
+    result = bridge.finalize_mlflow_run_impl(
+        experiment_id="exp_done",
+        mlflow_run_id="run-123",
+        tracking_uri="https://mlflow.example",
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "done"
+    assert set(result["uploaded_artifacts"]) == {"_DONE", "log_task_0.out", "status_task_0.out"}
+    assert ("start_run", {"run_id": "run-123"}) in calls
+    assert ("metric", "result", 1.0) in calls
+    assert result["log_fetch"] == {"fetched_artifacts": [], "errors": []}
+    artifacts = [item for item in calls if item[0] == "artifact"]
+    assert all(item[2] == "logs" for item in artifacts)
+
+
+def test_finalize_mlflow_run_fetches_nemo_logs_before_upload(tmp_path, monkeypatch):
+    """Terminal finalization fetches Nemo logs and uploads the fetched files."""
+    exp = tmp_path / "experiments" / "exp_done"
+    exp.mkdir(parents=True)
+    (exp / "_DONE").touch()
+    (exp / "status_task_0.out").write_text("succeeded\n")
+    monkeypatch.setenv("NEMORUN_HOME", str(tmp_path))
+
+    subprocess_calls = []
+
+    def fake_run(argv, **kwargs):
+        subprocess_calls.append((argv, kwargs))
+        job_idx = argv[-1]
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=f"log for task {job_idx}\n",
+            stderr="",
+        )
+
+    calls: list[tuple[Any, ...]] = []
+
+    class _Run:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class _MLflow:
+        def set_tracking_uri(self, uri):
+            calls.append(("tracking_uri", uri))
+
+        def start_run(self, **kwargs):
+            calls.append(("start_run", kwargs))
+            return _Run()
+
+        def log_param(self, key, value):
+            calls.append(("param", key, value))
+
+        def log_metric(self, key, value):
+            calls.append(("metric", key, value))
+
+        def set_tags(self, tags):
+            calls.append(("tags", tags))
+
+        def log_artifact(self, path, artifact_path=None):
+            calls.append(("artifact", path, artifact_path))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(bridge, "_setup_mlflow", lambda: (_MLflow(), None))
+
+    result = bridge.finalize_mlflow_run_impl(
+        experiment_id="exp_done",
+        mlflow_run_id="run-123",
+        tracking_uri="https://mlflow.example",
+        task_count=2,
+    )
+
+    assert result["ok"] is True
+    assert result["log_fetch"] == {
+        "fetched_artifacts": ["nemo_logs_task_0.log", "nemo_logs_task_1.log"],
+        "errors": [],
+    }
+    assert (exp / "nemo_logs_task_0.log").read_text() == "log for task 0\n"
+    assert (exp / "nemo_logs_task_1.log").read_text() == "log for task 1\n"
+    assert [call[0][-1] for call in subprocess_calls] == ["0", "1"]
+    uploaded = {Path(item[1]).name for item in calls if item[0] == "artifact"}
+    assert {"nemo_logs_task_0.log", "nemo_logs_task_1.log"} <= uploaded
+
+
+def test_wait_for_experiment_can_finalize_mlflow(tmp_path, monkeypatch):
+    """wait_for_experiment(..., finalize_mlflow=True) delegates finalization at terminal."""
+    exp = tmp_path / "experiments" / "exp_done"
+    exp.mkdir(parents=True)
+    (exp / "_DONE").touch()
+    (exp / "status_task_0.out").write_text("succeeded\n")
+    monkeypatch.setenv("NEMORUN_HOME", str(tmp_path))
+
+    seen = {}
+
+    def fake_finalize(**kwargs):
+        seen.update(kwargs)
+        return {"ok": True, "mlflow_run_id": kwargs["mlflow_run_id"]}
+
+    monkeypatch.setattr(bridge, "finalize_mlflow_run_impl", fake_finalize)
+    result = bridge.wait_for_experiment_impl(
+        "exp_done",
+        timeout_sec=10,
+        poll_interval_sec=1,
+        finalize_mlflow=True,
+        mlflow_run_id="run-123",
+        mlflow_tracking_uri="https://mlflow.example",
+    )
+
+    assert result["ok"] is True
+    assert result["mlflow_finalize"]["ok"] is True
+    assert seen == {
+        "experiment_id": "exp_done",
+        "mlflow_run_id": "run-123",
+        "tracking_uri": "https://mlflow.example",
+        "status": "done",
+        "task_count": 1,
+    }
 
 
 def test_wait_for_experiment_polls_until_done(tmp_path, monkeypatch):
