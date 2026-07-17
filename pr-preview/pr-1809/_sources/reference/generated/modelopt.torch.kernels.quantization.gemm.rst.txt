@@ -33,10 +33,6 @@ gemm
 
 
 
-   modelopt.torch.kernels.quantization.gemm.nvfp4_quant
-
-
-
 
 .. Autodoc anything defined in the module itself
 

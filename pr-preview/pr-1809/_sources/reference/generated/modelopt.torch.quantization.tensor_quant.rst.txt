@@ -32,7 +32,9 @@ tensor\_quant
       :nosignatures:
    
       DynamicBlockQuantizationFunction
+      FP4CastSTEFunction
       FakeTensorQuantFunction
+      IntCastSTEFunction
       ScaledE4M3Function
       StaticBlockwiseFP4FakeQuantFunction
    

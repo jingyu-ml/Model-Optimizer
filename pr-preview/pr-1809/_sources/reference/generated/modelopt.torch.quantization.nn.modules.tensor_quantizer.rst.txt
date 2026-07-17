@@ -34,6 +34,7 @@ tensor\_quantizer
       HardDisabledTensorQuantizer
       NVFP4StaticQuantizer
       SequentialQuantizer
+      StaticBlockScaleQuantizer
       TensorQuantizer
       TensorQuantizerCache
    

@@ -1,5 +1,5 @@
-bypass\_distillation
-====================
+quant\_aware\_conversion
+========================
 
 .. List the submodules
 
@@ -15,7 +15,7 @@ bypass\_distillation
    __module__ should be manually overridden -- i.e. in the ``__init__.py`` which contains ``from xxx import YYY``,
    add in ``YYY.__module__ = __name__``.
 
-.. automodule:: modelopt.torch.puzzletron.bypass_distillation
+.. automodule:: modelopt.torch.export.quant_aware_conversion
    :members:
    :undoc-members:
 
@@ -25,6 +25,14 @@ bypass\_distillation
 
    .. Overview table of available classes in the module
    
+   
+   .. rubric:: Classes
+
+   .. autosummary::
+      :nosignatures:
+   
+      RenameRule
+      SplitRule
    
    
 
@@ -37,6 +45,9 @@ bypass\_distillation
    .. autosummary::
       :nosignatures:
    
-      launch_bypass_distillation
+      apply_reverse_rules
+      build_reverse_name_mapper
+      revert_quant_config_names
+      revert_weight_conversion_quant_aware
    
    

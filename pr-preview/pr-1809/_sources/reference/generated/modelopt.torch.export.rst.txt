@@ -29,6 +29,10 @@ export
 
 
 
+   modelopt.torch.export.hf_export_handlers
+
+
+
    modelopt.torch.export.layer_utils
 
 
@@ -65,7 +69,15 @@ export
 
 
 
+   modelopt.torch.export.quant_aware_conversion
+
+
+
    modelopt.torch.export.quant_utils
+
+
+
+   modelopt.torch.export.registry
 
 
 

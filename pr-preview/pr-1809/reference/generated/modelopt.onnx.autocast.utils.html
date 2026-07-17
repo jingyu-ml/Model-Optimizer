@@ -6,9 +6,9 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>utils &mdash; Model Optimizer 0.0.1.dev1+ga20e49ed4</title>
+  <title>utils &mdash; Model Optimizer 0.0.1.dev1+gcfae0d70f</title>
       <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=b86133f3" />
-      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css?v=e59714d7" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css?v=9edc463e" />
       <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
       <link rel="stylesheet" type="text/css" href="../../_static/tabs.css?v=4c969af8" />
       <link rel="stylesheet" type="text/css" href="../../_static/togglebutton.css?v=9c3e77be" />
@@ -19,8 +19,8 @@
       <script src="../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../../_static/doctools.js?v=9bcbadda"></script>
-      <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+      <script src="../../_static/doctools.js?v=fd6eb6e6"></script>
+      <script src="../../_static/sphinx_highlight.js?v=6ffebe34"></script>
       <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../../_static/copybutton.js?v=20d3d275"></script>
       <script src="../../_static/tabs.js?v=3ee01567"></script>
@@ -28,7 +28,6 @@
       <script>let toggleHintHide = 'Click to hide';</script>
       <script>let toggleOpenOnPrint = 'true';</script>
       <script src="../../_static/togglebutton.js?v=b8b12719"></script>
-      <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
       <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script src="../../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../../genindex.html" />
@@ -60,7 +59,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../getting_started/1_overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../getting_started/2_installation.html">Installation</a></li>
-<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/llm_ptq" rel="noopener noreferrer" target="_blank">Quick Start: PTQ - PyTorch</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/hf_ptq" rel="noopener noreferrer" target="_blank">Quick Start: PTQ - PyTorch</a></li>
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/onnx_ptq" rel="noopener noreferrer" target="_blank">Quick Start: PTQ - ONNX</a></li>
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/torch_onnx" rel="noopener noreferrer" target="_blank">Quick Start: PTQ - PyTorch to ONNX</a></li>
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/windows" rel="noopener noreferrer" target="_blank">Quick Start: PTQ - Windows</a></li>
@@ -168,20 +167,46 @@ support the core functionality of model precision conversion.</p>
 <p class="rubric">Functions</p>
 <table class="autosummary longtable docutils align-default">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#modelopt.onnx.autocast.utils.get_op_types_not_supported_in_low_precision" title="modelopt.onnx.autocast.utils.get_op_types_not_supported_in_low_precision"><code class="xref py py-obj docutils literal notranslate"><span class="pre">get_op_types_not_supported_in_low_precision</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#modelopt.onnx.autocast.utils.clear_types_and_shapes_recursive" title="modelopt.onnx.autocast.utils.clear_types_and_shapes_recursive"><code class="xref py py-obj docutils literal notranslate"><span class="pre">clear_types_and_shapes_recursive</span></code></a></p></td>
+<td><p>Recursively clear type/shape information for a graph and all its subgraphs.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#modelopt.onnx.autocast.utils.get_op_types_not_supported_in_low_precision" title="modelopt.onnx.autocast.utils.get_op_types_not_supported_in_low_precision"><code class="xref py py-obj docutils literal notranslate"><span class="pre">get_op_types_not_supported_in_low_precision</span></code></a></p></td>
 <td><p>Get a list of ops not supported in low precision for the opset_version = max(model.opset, min_opset).</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#modelopt.onnx.autocast.utils.get_unique_consumer_node" title="modelopt.onnx.autocast.utils.get_unique_consumer_node"><code class="xref py py-obj docutils literal notranslate"><span class="pre">get_unique_consumer_node</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#modelopt.onnx.autocast.utils.get_unique_consumer_node" title="modelopt.onnx.autocast.utils.get_unique_consumer_node"><code class="xref py py-obj docutils literal notranslate"><span class="pre">get_unique_consumer_node</span></code></a></p></td>
 <td><p>Get a single consumer node and raise exception if there are multiple consumers.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#modelopt.onnx.autocast.utils.setup_mappings" title="modelopt.onnx.autocast.utils.setup_mappings"><code class="xref py py-obj docutils literal notranslate"><span class="pre">setup_mappings</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#modelopt.onnx.autocast.utils.setup_mappings" title="modelopt.onnx.autocast.utils.setup_mappings"><code class="xref py py-obj docutils literal notranslate"><span class="pre">setup_mappings</span></code></a></p></td>
 <td><p>Setup and return mappings for model components.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#modelopt.onnx.autocast.utils.walk_subgraphs_recursive" title="modelopt.onnx.autocast.utils.walk_subgraphs_recursive"><code class="xref py py-obj docutils literal notranslate"><span class="pre">walk_subgraphs_recursive</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#modelopt.onnx.autocast.utils.walk_subgraphs_recursive" title="modelopt.onnx.autocast.utils.walk_subgraphs_recursive"><code class="xref py py-obj docutils literal notranslate"><span class="pre">walk_subgraphs_recursive</span></code></a></p></td>
 <td><p>Recursively walk through a graph and all its subgraphs, applying a callback.</p></td>
 </tr>
 </tbody>
 </table>
+<dl class="py function">
+<dt class="sig sig-object py" id="modelopt.onnx.autocast.utils.clear_types_and_shapes_recursive">
+<span class="sig-name descname"><span class="pre">clear_types_and_shapes_recursive</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">clear_shapes</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">is_subgraph</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#modelopt.onnx.autocast.utils.clear_types_and_shapes_recursive" title="Link to this definition"></a></dt>
+<dd><p>Recursively clear type/shape information for a graph and all its subgraphs.</p>
+<p>Resets intermediate (<code class="docutils literal notranslate"><span class="pre">value_info</span></code>) and output tensor types to <code class="docutils literal notranslate"><span class="pre">UNDEFINED</span></code> and, when
+<code class="docutils literal notranslate"><span class="pre">clear_shapes</span></code> is True, replaces concrete dims with a symbolic <code class="docutils literal notranslate"><span class="pre">&quot;unk&quot;</span></code> so a subsequent
+<a class="reference internal" href="modelopt.onnx.utils.html#modelopt.onnx.utils.infer_types" title="modelopt.onnx.utils.infer_types"><code class="xref py py-func docutils literal notranslate"><span class="pre">modelopt.onnx.utils.infer_types()</span></code></a> re-derives them from the operator graph. For subgraphs,
+input types/shapes are cleared too so they propagate from the parent graph. This does not change
+tensor <em>rank</em>, so it cannot repair a stale rank (see <code class="docutils literal notranslate"><span class="pre">_reconcile_stale_output_shapes</span></code>).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>graph</strong> (<em>GraphProto</em>) – The ONNX graph to clear types and shapes for.</p></li>
+<li><p><strong>clear_shapes</strong> (<em>bool</em>) – If True, also clear shapes (False keeps shapes for type-only inference).</p></li>
+<li><p><strong>is_subgraph</strong> (<em>bool</em>) – Whether this is a subgraph (True) or the main graph (False).</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><em>None</em></p>
+</dd>
+</dl>
+</dd></dl>
+
 <dl class="py function">
 <dt class="sig sig-object py" id="modelopt.onnx.autocast.utils.get_op_types_not_supported_in_low_precision">
 <span class="sig-name descname"><span class="pre">get_op_types_not_supported_in_low_precision</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">model</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">min_opset</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">low_precision_type</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'float16'</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#modelopt.onnx.autocast.utils.get_op_types_not_supported_in_low_precision" title="Link to this definition"></a></dt>

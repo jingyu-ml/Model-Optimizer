@@ -39,6 +39,7 @@ ort\_utils
    
       configure_ort
       create_inference_session
+      create_input_shapes_profile
       get_quantizable_op_types
       update_trt_ep_support
    

@@ -5,6 +5,17 @@ attention
 
 
 
+.. rubric:: Modules
+
+.. autosummary::
+   :toctree:
+   :recursive:
+
+
+
+   modelopt.torch.kernels.quantization.attention.bmm2_qdq
+
+
 
 
 .. Autodoc anything defined in the module itself

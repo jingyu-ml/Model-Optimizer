@@ -68,7 +68,6 @@ layer\_utils
       is_linear
       is_mlp
       is_moe
-      is_quantconv3d
       is_quantlinear
       is_recurrent
       model_type_is_enc_dec

@@ -37,6 +37,7 @@ utils
    .. autosummary::
       :nosignatures:
    
+      clear_types_and_shapes_recursive
       get_op_types_not_supported_in_low_precision
       get_unique_consumer_node
       setup_mappings

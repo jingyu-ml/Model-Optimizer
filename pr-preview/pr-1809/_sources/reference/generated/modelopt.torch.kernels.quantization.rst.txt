@@ -17,6 +17,10 @@ quantization
 
 
 
+   modelopt.torch.kernels.quantization.common
+
+
+
    modelopt.torch.kernels.quantization.conv
 
 

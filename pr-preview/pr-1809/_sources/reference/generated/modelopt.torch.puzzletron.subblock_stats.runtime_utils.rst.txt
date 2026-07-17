@@ -44,6 +44,7 @@ runtime\_utils
    .. autosummary::
       :nosignatures:
    
+      convert_config_to_vllm_anymodel
       save_model
       save_model_as_anymodel
    

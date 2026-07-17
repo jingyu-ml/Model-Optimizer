@@ -6,9 +6,9 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>utils &mdash; Model Optimizer 0.0.1.dev1+ga20e49ed4</title>
+  <title>utils &mdash; Model Optimizer 0.0.1.dev1+gcfae0d70f</title>
       <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=b86133f3" />
-      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css?v=e59714d7" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css?v=9edc463e" />
       <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
       <link rel="stylesheet" type="text/css" href="../../_static/tabs.css?v=4c969af8" />
       <link rel="stylesheet" type="text/css" href="../../_static/togglebutton.css?v=9c3e77be" />
@@ -19,8 +19,8 @@
       <script src="../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../../_static/doctools.js?v=9bcbadda"></script>
-      <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+      <script src="../../_static/doctools.js?v=fd6eb6e6"></script>
+      <script src="../../_static/sphinx_highlight.js?v=6ffebe34"></script>
       <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../../_static/copybutton.js?v=20d3d275"></script>
       <script src="../../_static/tabs.js?v=3ee01567"></script>
@@ -28,7 +28,6 @@
       <script>let toggleHintHide = 'Click to hide';</script>
       <script>let toggleOpenOnPrint = 'true';</script>
       <script src="../../_static/togglebutton.js?v=b8b12719"></script>
-      <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
       <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script src="../../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../../genindex.html" />
@@ -60,7 +59,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../getting_started/1_overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../getting_started/2_installation.html">Installation</a></li>
-<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/llm_ptq" rel="noopener noreferrer" target="_blank">Quick Start: PTQ - PyTorch</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/hf_ptq" rel="noopener noreferrer" target="_blank">Quick Start: PTQ - PyTorch</a></li>
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/onnx_ptq" rel="noopener noreferrer" target="_blank">Quick Start: PTQ - ONNX</a></li>
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/torch_onnx" rel="noopener noreferrer" target="_blank">Quick Start: PTQ - PyTorch to ONNX</a></li>
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/windows" rel="noopener noreferrer" target="_blank">Quick Start: PTQ - Windows</a></li>
@@ -222,7 +221,7 @@
 <td><p>Checks if the model uses external data.</p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#modelopt.onnx.utils.clear_stale_value_info" title="modelopt.onnx.utils.clear_stale_value_info"><code class="xref py py-obj docutils literal notranslate"><span class="pre">clear_stale_value_info</span></code></a></p></td>
-<td><p>Clear stale type metadata that would otherwise trip ORT's type checker.</p></td>
+<td><p>Clear stale type/shape metadata that would otherwise trip ORT's type checker.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#modelopt.onnx.utils.duplicate_shared_constants" title="modelopt.onnx.utils.duplicate_shared_constants"><code class="xref py py-obj docutils literal notranslate"><span class="pre">duplicate_shared_constants</span></code></a></p></td>
 <td><p>Duplicate constant tensors if they are shared.</p></td>
@@ -428,19 +427,21 @@ these will be changed from FP32 to FP16.</p></li>
 <dl class="py function">
 <dt class="sig sig-object py" id="modelopt.onnx.utils.clear_stale_value_info">
 <span class="sig-name descname"><span class="pre">clear_stale_value_info</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">model</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#modelopt.onnx.utils.clear_stale_value_info" title="Link to this definition"></a></dt>
-<dd><p>Clear stale type metadata that would otherwise trip ORT’s type checker.</p>
-<p>Walks every <code class="docutils literal notranslate"><span class="pre">Cast</span></code> node and forces the <code class="docutils literal notranslate"><span class="pre">elem_type</span></code> of any
-<code class="docutils literal notranslate"><span class="pre">graph.output</span></code> entry produced by that Cast to match the Cast’s <code class="docutils literal notranslate"><span class="pre">to</span></code>
-attribute (the spec-defined contract for a Cast’s output dtype). Then
-clears <code class="docutils literal notranslate"><span class="pre">value_info</span></code> so ORT/shape-inference re-derives intermediate-tensor
-types from the operator graph during session setup – except entries for
-outputs of <code class="docutils literal notranslate"><span class="pre">trt.plugins</span></code> custom-op nodes, whose types ORT cannot infer.</p>
+<dd><p>Clear stale type/shape metadata that would otherwise trip ORT’s type checker.</p>
+<p>Walks every <code class="docutils literal notranslate"><span class="pre">Cast</span></code> node and forces the <code class="docutils literal notranslate"><span class="pre">elem_type</span></code> of any <code class="docutils literal notranslate"><span class="pre">graph.output</span></code>
+entry produced by that Cast to match the Cast’s <code class="docutils literal notranslate"><span class="pre">to</span></code> attribute (the spec-defined
+contract for a Cast’s output dtype). Clears <code class="docutils literal notranslate"><span class="pre">value_info</span></code> so ORT/shape-inference
+re-derives intermediate-tensor types from the operator graph during session setup
+– except entries for outputs of <code class="docutils literal notranslate"><span class="pre">trt.plugins</span></code> custom-op nodes, whose types ORT
+cannot infer. Finally, reconciles stale <code class="docutils literal notranslate"><span class="pre">graph.output</span></code> <em>shapes</em> (e.g. a leftover
+rank-0 scalar on a tensor that is really rank-2+) which would otherwise propagate a
+wrong rank into downstream shape inference.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>model</strong> (<em>ModelProto</em>) – Loaded in-memory onnx ModelProto.</p>
 </dd>
 <dt class="field-even">Returns<span class="colon">:</span></dt>
-<dd class="field-even"><p>Number of Cast outputs reconciled plus value_info entries cleared.</p>
+<dd class="field-even"><p>Total number of entries reconciled or cleared.</p>
 </dd>
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
 <dd class="field-odd"><p><em>int</em></p>
@@ -1018,13 +1019,21 @@ wires the DQ output to FP16 in value_info so shape inference stays consistent.</
 <dd><p>Infers types (and optionally shapes) based on the use_standalone_type_inference flag.</p>
 <p>When use_standalone_type_inference is True, uses a standalone type inference implementation
 that only infers types. Otherwise, uses ONNX’s infer_shapes which infers both types and shapes.</p>
+<p>ONNX’s <code class="docutils literal notranslate"><span class="pre">infer_shapes</span></code> can fail on weakly-typed models – with <code class="docutils literal notranslate"><span class="pre">strict_mode=True</span></code> it raises
+on an op it cannot resolve (e.g. a <code class="docutils literal notranslate"><span class="pre">TopK</span></code> whose axis it resolves to a stale dimension)
+instead of silently leaving that node’s outputs untyped. On any shape-inference failure this
+falls back to the standalone type inferencer, which derives types from operator schemas
+regardless of shapes, so downstream type lookups (e.g. in AutoCast) do not fail. Callers that
+need a fully typed graph should pass <code class="docutils literal notranslate"><span class="pre">strict_mode=True</span></code> so incomplete inference surfaces as
+an exception that triggers the fallback.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>model</strong> (<em>ModelProto</em>) – ONNX model to infer types/shapes for.</p></li>
 <li><p><strong>use_standalone_type_inference</strong> (<em>bool</em>) – If True, use standalone type inference (_infer_types_only).
 If False, use ONNX’s shape inference (infer_shapes).</p></li>
-<li><p><strong>**kwargs</strong> – Additional arguments passed to infer_shapes when not using standalone type inference.</p></li>
+<li><p><strong>**kwargs</strong> – Additional arguments passed to infer_shapes when not using standalone type
+inference (e.g. <code class="docutils literal notranslate"><span class="pre">strict_mode</span></code>, <code class="docutils literal notranslate"><span class="pre">check_type</span></code>, <code class="docutils literal notranslate"><span class="pre">data_prop</span></code>).</p></li>
 </ul>
 </dd>
 <dt class="field-even">Returns<span class="colon">:</span></dt>

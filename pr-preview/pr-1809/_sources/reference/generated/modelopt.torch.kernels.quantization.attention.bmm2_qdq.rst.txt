@@ -1,5 +1,5 @@
-nvfp4\_quant
-============
+bmm2\_qdq
+=========
 
 .. List the submodules
 
@@ -15,7 +15,7 @@ nvfp4\_quant
    __module__ should be manually overridden -- i.e. in the ``__init__.py`` which contains ``from xxx import YYY``,
    add in ``YYY.__module__ = __name__``.
 
-.. automodule:: modelopt.torch.kernels.quantization.gemm.nvfp4_quant
+.. automodule:: modelopt.torch.kernels.quantization.attention.bmm2_qdq
    :members:
    :undoc-members:
 
@@ -31,5 +31,12 @@ nvfp4\_quant
 
    .. Overview table of available functions in the module
    
+   
+   .. rubric:: Functions
+
+   .. autosummary::
+      :nosignatures:
+   
+      fake_quant_v_onwrite
    
    

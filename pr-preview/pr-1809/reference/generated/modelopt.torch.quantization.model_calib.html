@@ -6,9 +6,9 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>model_calib &mdash; Model Optimizer 0.0.1.dev1+ga20e49ed4</title>
+  <title>model_calib &mdash; Model Optimizer 0.0.1.dev1+gcfae0d70f</title>
       <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=b86133f3" />
-      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css?v=e59714d7" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css?v=9edc463e" />
       <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
       <link rel="stylesheet" type="text/css" href="../../_static/tabs.css?v=4c969af8" />
       <link rel="stylesheet" type="text/css" href="../../_static/togglebutton.css?v=9c3e77be" />
@@ -19,8 +19,8 @@
       <script src="../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../../_static/doctools.js?v=9bcbadda"></script>
-      <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+      <script src="../../_static/doctools.js?v=fd6eb6e6"></script>
+      <script src="../../_static/sphinx_highlight.js?v=6ffebe34"></script>
       <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../../_static/copybutton.js?v=20d3d275"></script>
       <script src="../../_static/tabs.js?v=3ee01567"></script>
@@ -28,7 +28,6 @@
       <script>let toggleHintHide = 'Click to hide';</script>
       <script>let toggleOpenOnPrint = 'true';</script>
       <script src="../../_static/togglebutton.js?v=b8b12719"></script>
-      <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
       <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script src="../../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../../genindex.html" />
@@ -60,7 +59,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../getting_started/1_overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../getting_started/2_installation.html">Installation</a></li>
-<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/llm_ptq" rel="noopener noreferrer" target="_blank">Quick Start: PTQ - PyTorch</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/hf_ptq" rel="noopener noreferrer" target="_blank">Quick Start: PTQ - PyTorch</a></li>
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/onnx_ptq" rel="noopener noreferrer" target="_blank">Quick Start: PTQ - ONNX</a></li>
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/torch_onnx" rel="noopener noreferrer" target="_blank">Quick Start: PTQ - PyTorch to ONNX</a></li>
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/windows" rel="noopener noreferrer" target="_blank">Quick Start: PTQ - Windows</a></li>
@@ -187,13 +186,16 @@
 <tr class="row-odd"><td><p><a class="reference internal" href="#modelopt.torch.quantization.model_calib.local_hessian_calibrate" title="modelopt.torch.quantization.model_calib.local_hessian_calibrate"><code class="xref py py-obj docutils literal notranslate"><span class="pre">local_hessian_calibrate</span></code></a></p></td>
 <td><p>Calibrate weight quantizers by minimizing the Hessian-weighted error.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#modelopt.torch.quantization.model_calib.max_calibrate" title="modelopt.torch.quantization.model_calib.max_calibrate"><code class="xref py py-obj docutils literal notranslate"><span class="pre">max_calibrate</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#modelopt.torch.quantization.model_calib.lsq" title="modelopt.torch.quantization.model_calib.lsq"><code class="xref py py-obj docutils literal notranslate"><span class="pre">lsq</span></code></a></p></td>
+<td><p>Run scale calibration then convert to LSQ mode.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#modelopt.torch.quantization.model_calib.max_calibrate" title="modelopt.torch.quantization.model_calib.max_calibrate"><code class="xref py py-obj docutils literal notranslate"><span class="pre">max_calibrate</span></code></a></p></td>
 <td><p>Calibrate the model using max.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#modelopt.torch.quantization.model_calib.smoothquant" title="modelopt.torch.quantization.model_calib.smoothquant"><code class="xref py py-obj docutils literal notranslate"><span class="pre">smoothquant</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#modelopt.torch.quantization.model_calib.smoothquant" title="modelopt.torch.quantization.model_calib.smoothquant"><code class="xref py py-obj docutils literal notranslate"><span class="pre">smoothquant</span></code></a></p></td>
 <td><p>Smooth-Quant variant with per-channel weight scaling.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#modelopt.torch.quantization.model_calib.svdquant" title="modelopt.torch.quantization.model_calib.svdquant"><code class="xref py py-obj docutils literal notranslate"><span class="pre">svdquant</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#modelopt.torch.quantization.model_calib.svdquant" title="modelopt.torch.quantization.model_calib.svdquant"><code class="xref py py-obj docutils literal notranslate"><span class="pre">svdquant</span></code></a></p></td>
 <td><p>Lite version of SVDQuant.</p></td>
 </tr>
 </tbody>
@@ -276,8 +278,31 @@ for details on the configuration options.</p>
 </dd></dl>
 
 <dl class="py function">
+<dt class="sig sig-object py" id="modelopt.torch.quantization.model_calib.lsq">
+<span class="sig-name descname"><span class="pre">lsq</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">model</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">forward_loop</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">scale_algorithm</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">learnable_amax</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">('post',)</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tied_amax</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">quantize_pre_scale</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#modelopt.torch.quantization.model_calib.lsq" title="Link to this definition"></a></dt>
+<dd><p>Run scale calibration then convert to LSQ mode.</p>
+<p>Uses separate pre (quant) and post (dequant) amax values.
+Forward: <code class="docutils literal notranslate"><span class="pre">w_q</span> <span class="pre">=</span> <span class="pre">Q_STE(w</span> <span class="pre">/</span> <span class="pre">s_pre)</span> <span class="pre">*</span> <span class="pre">s_post</span></code> where <code class="docutils literal notranslate"><span class="pre">s</span> <span class="pre">=</span> <span class="pre">amax</span> <span class="pre">/</span> <span class="pre">Q_max</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>model</strong> (<em>Module</em>) – Quantized model.</p></li>
+<li><p><strong>forward_loop</strong> (<em>Callable</em><em>[</em><em>[</em><em>Module</em><em>]</em><em>, </em><em>None</em><em>] </em><em>| </em><em>None</em>) – Calibration data forward loop.</p></li>
+<li><p><strong>scale_algorithm</strong> (<em>dict</em><em> | </em><em>None</em>) – Calibration algorithm config to run first.
+Dict with ‘method’ key: ‘mse’, ‘local_hessian’, or ‘max’.
+Defaults to {‘method’: ‘mse’} if None.</p></li>
+<li><p><strong>learnable_amax</strong> (<em>list</em><em> | </em><em>str</em>) – Which amax params are learnable: ‘pre’, ‘post’,
+[‘pre’, ‘post’], or [].</p></li>
+<li><p><strong>tied_amax</strong> (<em>bool</em>) – If True, pre and post share a single tensor.</p></li>
+<li><p><strong>quantize_pre_scale</strong> (<em>bool</em>) – If False, skip FP8 quantization for the LSQ pre scale.</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
 <dt class="sig sig-object py" id="modelopt.torch.quantization.model_calib.max_calibrate">
-<span class="sig-name descname"><span class="pre">max_calibrate</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">model</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">forward_loop</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">distributed_sync</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sync_expert_weight_amax</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">shared_states</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#modelopt.torch.quantization.model_calib.max_calibrate" title="Link to this definition"></a></dt>
+<span class="sig-name descname"><span class="pre">max_calibrate</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">model</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">forward_loop</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">distributed_sync</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sync_expert_weight_amax</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">shared_states</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">skip_forward_without_activation_calib</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#modelopt.torch.quantization.model_calib.max_calibrate" title="Link to this definition"></a></dt>
 <dd><p>Calibrate the model using max.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
@@ -291,6 +316,11 @@ in a MoE layer (within-rank sync + EP all-reduce when EP&gt;1).</p></li>
 <li><p><strong>shared_states</strong> (<em>Mapping</em><em>[</em><em>str</em><em>, </em><em>Mapping</em><em>[</em><em>str</em><em>, </em><em>Sequence</em><em>[</em><em>str</em><em>]</em><em>]</em><em>] </em><em>| </em><em>None</em>) – Optional dict keyed by shared-state name. <code class="docutils literal notranslate"><span class="pre">&quot;weight_global_amax&quot;</span></code> is
 implemented today and accepts <code class="docutils literal notranslate"><span class="pre">{&quot;patterns&quot;:</span> <span class="pre">[...]}</span></code>; omitted patterns use
 <code class="docutils literal notranslate"><span class="pre">SHARED_PATTERNS</span></code>, while an empty list disables the state.</p></li>
+<li><p><strong>skip_forward_without_activation_calib</strong> (<em>bool</em>) – If True, skip the (potentially expensive)
+<code class="docutils literal notranslate"><span class="pre">forward_loop</span></code> when no enabled quantizer needs data-driven activation statistics
+(see <code class="xref py py-func docutils literal notranslate"><span class="pre">_needs_activation_forward_for_max_calib()</span></code>). Weight calibration still runs.
+Only opt-in for the top-level <code class="docutils literal notranslate"><span class="pre">max</span></code> path; algorithms that always need activations
+(MSE, local Hessian, SmoothQuant, SVDQuant, GPTQ) call this with the default False.</p></li>
 </ul>
 </dd>
 </dl>
@@ -317,7 +347,7 @@ details on the remaining arguments.</p>
 
 <dl class="py function">
 <dt class="sig sig-object py" id="modelopt.torch.quantization.model_calib.svdquant">
-<span class="sig-name descname"><span class="pre">svdquant</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">model</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">forward_loop</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">lowrank</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">32</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#modelopt.torch.quantization.model_calib.svdquant" title="Link to this definition"></a></dt>
+<span class="sig-name descname"><span class="pre">svdquant</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">model</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">forward_loop</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">lowrank</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">32</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">skip_layers</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#modelopt.torch.quantization.model_calib.svdquant" title="Link to this definition"></a></dt>
 <dd><p>Lite version of SVDQuant.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
@@ -326,6 +356,7 @@ details on the remaining arguments.</p>
 <li><p><strong>forward_loop</strong> (<em>Callable</em><em>[</em><em>[</em><em>Module</em><em>]</em><em>, </em><em>None</em><em>] </em><em>| </em><em>None</em>) – A callable which takes the model as argument and
 forwards calibration data through the model.</p></li>
 <li><p><strong>lowrank</strong> (<em>int</em>)</p></li>
+<li><p><strong>skip_layers</strong> (<em>list</em><em>[</em><em>str</em><em>] </em><em>| </em><em>None</em>)</p></li>
 </ul>
 </dd>
 </dl>

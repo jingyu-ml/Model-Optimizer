@@ -6,9 +6,9 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>graph_utils &mdash; Model Optimizer 0.0.1.dev1+ga20e49ed4</title>
+  <title>graph_utils &mdash; Model Optimizer 0.0.1.dev1+gcfae0d70f</title>
       <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=b86133f3" />
-      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css?v=e59714d7" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css?v=9edc463e" />
       <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
       <link rel="stylesheet" type="text/css" href="../../_static/tabs.css?v=4c969af8" />
       <link rel="stylesheet" type="text/css" href="../../_static/togglebutton.css?v=9c3e77be" />
@@ -19,8 +19,8 @@
       <script src="../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../../_static/doctools.js?v=9bcbadda"></script>
-      <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+      <script src="../../_static/doctools.js?v=fd6eb6e6"></script>
+      <script src="../../_static/sphinx_highlight.js?v=6ffebe34"></script>
       <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../../_static/copybutton.js?v=20d3d275"></script>
       <script src="../../_static/tabs.js?v=3ee01567"></script>
@@ -28,7 +28,6 @@
       <script>let toggleHintHide = 'Click to hide';</script>
       <script>let toggleOpenOnPrint = 'true';</script>
       <script src="../../_static/togglebutton.js?v=b8b12719"></script>
-      <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
       <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script src="../../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../../genindex.html" />
@@ -60,7 +59,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../getting_started/1_overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../getting_started/2_installation.html">Installation</a></li>
-<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/llm_ptq" rel="noopener noreferrer" target="_blank">Quick Start: PTQ - PyTorch</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/hf_ptq" rel="noopener noreferrer" target="_blank">Quick Start: PTQ - PyTorch</a></li>
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/onnx_ptq" rel="noopener noreferrer" target="_blank">Quick Start: PTQ - ONNX</a></li>
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/torch_onnx" rel="noopener noreferrer" target="_blank">Quick Start: PTQ - PyTorch to ONNX</a></li>
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/windows" rel="noopener noreferrer" target="_blank">Quick Start: PTQ - Windows</a></li>
@@ -458,7 +457,7 @@ Small-channel convolutions do not benefit from FP8 quantization.</p></li>
 
 <dl class="py function">
 <dt class="sig sig-object py" id="modelopt.onnx.quantization.graph_utils.find_nodes_from_matmul_to_exclude">
-<span class="sig-name descname"><span class="pre">find_nodes_from_matmul_to_exclude</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">onnx_path</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">use_external_data_format</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">intermediate_generated_files</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">calibration_data_reader</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">calibration_eps</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">['cpu',</span> <span class="pre">'cuda:0',</span> <span class="pre">'trt']</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">calibration_shapes</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#modelopt.onnx.quantization.graph_utils.find_nodes_from_matmul_to_exclude" title="Link to this definition"></a></dt>
+<span class="sig-name descname"><span class="pre">find_nodes_from_matmul_to_exclude</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">onnx_path</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">use_external_data_format</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">intermediate_generated_files</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">calibration_data_reader</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">calibration_eps</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">['cpu',</span> <span class="pre">'cuda:0',</span> <span class="pre">'trt']</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">calibration_shapes</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">input_shapes_profile</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#modelopt.onnx.quantization.graph_utils.find_nodes_from_matmul_to_exclude" title="Link to this definition"></a></dt>
 <dd><p>Find MatMul nodes that meet gemv or small-gemm conditions and should be excluded.</p>
 <p>A MatMul is excluded if either:</p>
 <ul class="simple">
@@ -479,6 +478,7 @@ weights of the intermediate model.</p></li>
 instead of calibration_data_reader.</p></li>
 <li><p><strong>calibration_eps</strong> (<em>list</em><em>[</em><em>str</em><em>]</em>) – Priority order for the execution providers (EP) to calibrate the model.
 Any subset of [‘cuda:x’, ‘cpu’, ‘trt’], where ‘x’ is the device id.</p></li>
+<li><p><strong>input_shapes_profile</strong> (<em>Sequence</em><em>[</em><em>dict</em><em>[</em><em>str</em><em>, </em><em>str</em><em>]</em><em>] </em><em>| </em><em>None</em>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Returns<span class="colon">:</span></dt>
@@ -492,7 +492,7 @@ Any subset of [‘cuda:x’, ‘cpu’, ‘trt’], where ‘x’ is the device 
 
 <dl class="py function">
 <dt class="sig sig-object py" id="modelopt.onnx.quantization.graph_utils.find_nodes_from_mha_to_exclude">
-<span class="sig-name descname"><span class="pre">find_nodes_from_mha_to_exclude</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">onnx_path</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">use_external_data_format</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">nodes_to_exclude</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">disable_mha_qdq</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">quantize_mode</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'int8'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">intermediate_generated_files</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">calibration_data_reader</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">calibration_eps</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">['cpu',</span> <span class="pre">'cuda:0',</span> <span class="pre">'trt']</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#modelopt.onnx.quantization.graph_utils.find_nodes_from_mha_to_exclude" title="Link to this definition"></a></dt>
+<span class="sig-name descname"><span class="pre">find_nodes_from_mha_to_exclude</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">onnx_path</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">use_external_data_format</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">nodes_to_exclude</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">disable_mha_qdq</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">quantize_mode</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'int8'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">intermediate_generated_files</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">calibration_data_reader</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">calibration_eps</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">['cpu',</span> <span class="pre">'cuda:0',</span> <span class="pre">'trt']</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">input_shapes_profile</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#modelopt.onnx.quantization.graph_utils.find_nodes_from_mha_to_exclude" title="Link to this definition"></a></dt>
 <dd><p>Find MatMul nodes in MHA pattern to exclude.</p>
 <p>If disable_mha_qdq is set, don’t add Q/DQ layers to MatMuls in MHA pattern.
 else when quantize_mode == “fp8”, if head_size &gt; 256 or head_size &lt;= 8 or
@@ -511,6 +511,7 @@ Else, each MHA will be checked whether to enable QDQ or not when is_fp8fp16 is T
 <li><p><strong>intermediate_generated_files</strong> (<em>list</em><em>[</em><em>str</em><em>] </em><em>| </em><em>None</em>) – List of intermediate generated files that will be deleted after quantization.</p></li>
 <li><p><strong>calibration_data_reader</strong> (<em>CalibrationDataReader</em>) – Calibration data reader for running inference.</p></li>
 <li><p><strong>calibration_eps</strong> (<em>list</em><em>[</em><em>str</em><em>]</em>) – Priority list of execution providers (EP) for calibration.</p></li>
+<li><p><strong>input_shapes_profile</strong> (<em>Sequence</em><em>[</em><em>dict</em><em>[</em><em>str</em><em>, </em><em>str</em><em>]</em><em>] </em><em>| </em><em>None</em>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Returns<span class="colon">:</span></dt>
@@ -579,7 +580,7 @@ This format is convenient for calibrator to assign the same scaling factor.</p>
 
 <dl class="py function">
 <dt class="sig sig-object py" id="modelopt.onnx.quantization.graph_utils.get_extended_model_outputs">
-<span class="sig-name descname"><span class="pre">get_extended_model_outputs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">onnx_path</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">extended_model</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">use_external_data_format</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">intermediate_generated_files</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">calibration_data_reader</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">calibration_eps</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#modelopt.onnx.quantization.graph_utils.get_extended_model_outputs" title="Link to this definition"></a></dt>
+<span class="sig-name descname"><span class="pre">get_extended_model_outputs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">onnx_path</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">extended_model</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">use_external_data_format</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">intermediate_generated_files</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">calibration_data_reader</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">calibration_eps</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">input_shapes_profile</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#modelopt.onnx.quantization.graph_utils.get_extended_model_outputs" title="Link to this definition"></a></dt>
 <dd><p>Run one inference step on an onnx model which has some intermediate tensor marked as model outputs.</p>
 <p>The first calibration data is used for the dummy inference. This is useful when we want to know the shape of an
 intermediate tensor given the calibration data.</p>
@@ -593,6 +594,7 @@ intermediate tensor given the calibration data.</p>
 <li><p><strong>calibration_data_reader</strong> (<em>CalibrationDataReader</em>) – Calibration data reader for running inference.</p></li>
 <li><p><strong>calibration_eps</strong> (<em>list</em><em>[</em><em>str</em><em>]</em>) – Priority order for the execution providers (EP) to calibrate the model.
 Any subset of [‘cuda:x’, ‘cpu’, ‘trt’], where ‘x’ is the device id.</p></li>
+<li><p><strong>input_shapes_profile</strong> (<em>Sequence</em><em>[</em><em>dict</em><em>[</em><em>str</em><em>, </em><em>str</em><em>]</em><em>] </em><em>| </em><em>None</em>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>

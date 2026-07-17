@@ -6,9 +6,9 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>nvfp4_quant &mdash; Model Optimizer 0.0.1.dev1+ga20e49ed4</title>
+  <title>common &mdash; Model Optimizer 0.0.1.dev1+gcfae0d70f</title>
       <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=b86133f3" />
-      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css?v=e59714d7" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css?v=9edc463e" />
       <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
       <link rel="stylesheet" type="text/css" href="../../_static/tabs.css?v=4c969af8" />
       <link rel="stylesheet" type="text/css" href="../../_static/togglebutton.css?v=9c3e77be" />
@@ -19,8 +19,8 @@
       <script src="../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../../_static/doctools.js?v=9bcbadda"></script>
-      <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+      <script src="../../_static/doctools.js?v=fd6eb6e6"></script>
+      <script src="../../_static/sphinx_highlight.js?v=6ffebe34"></script>
       <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../../_static/copybutton.js?v=20d3d275"></script>
       <script src="../../_static/tabs.js?v=3ee01567"></script>
@@ -29,12 +29,11 @@
       <script>let toggleOpenOnPrint = 'true';</script>
       <script src="../../_static/togglebutton.js?v=b8b12719"></script>
       <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
-      <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script src="../../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../../genindex.html" />
     <link rel="search" title="Search" href="../../search.html" />
-    <link rel="next" title="sparsity" href="modelopt.torch.kernels.sparsity.html" />
-    <link rel="prev" title="nvfp4_fp8_sweep" href="modelopt.torch.kernels.quantization.gemm.nvfp4_fp8_sweep.html" /> 
+    <link rel="next" title="fp8_quant" href="modelopt.torch.kernels.quantization.common.fp8_quant.html" />
+    <link rel="prev" title="bmm2_qdq" href="modelopt.torch.kernels.quantization.attention.bmm2_qdq.html" /> 
 </head>
 
 <body class="wy-body-for-nav"> 
@@ -60,7 +59,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../getting_started/1_overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../getting_started/2_installation.html">Installation</a></li>
-<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/llm_ptq" rel="noopener noreferrer" target="_blank">Quick Start: PTQ - PyTorch</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/hf_ptq" rel="noopener noreferrer" target="_blank">Quick Start: PTQ - PyTorch</a></li>
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/onnx_ptq" rel="noopener noreferrer" target="_blank">Quick Start: PTQ - ONNX</a></li>
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/torch_onnx" rel="noopener noreferrer" target="_blank">Quick Start: PTQ - PyTorch to ONNX</a></li>
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/windows" rel="noopener noreferrer" target="_blank">Quick Start: PTQ - Windows</a></li>
@@ -150,10 +149,9 @@
           <li class="breadcrumb-item"><a href="modelopt.torch.html">torch</a></li>
           <li class="breadcrumb-item"><a href="modelopt.torch.kernels.html">kernels</a></li>
           <li class="breadcrumb-item"><a href="modelopt.torch.kernels.quantization.html">quantization</a></li>
-          <li class="breadcrumb-item"><a href="modelopt.torch.kernels.quantization.gemm.html">gemm</a></li>
-      <li class="breadcrumb-item active">nvfp4_quant</li>
+      <li class="breadcrumb-item active">common</li>
       <li class="wy-breadcrumbs-aside">
-            <a href="../../_sources/reference/generated/modelopt.torch.kernels.quantization.gemm.nvfp4_quant.rst.txt" rel="nofollow"> View page source</a>
+            <a href="../../_sources/reference/generated/modelopt.torch.kernels.quantization.common.rst.txt" rel="nofollow"> View page source</a>
       </li>
   </ul>
   <hr/>
@@ -161,26 +159,30 @@
           <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
            <div itemprop="articleBody">
              
-  <section id="nvfp4-quant">
-<h1>nvfp4_quant<a class="headerlink" href="#nvfp4-quant" title="Link to this heading"></a></h1>
-<p id="module-modelopt.torch.kernels.quantization.gemm.nvfp4_quant">Composable Triton JIT functions for NVFP4 (E2M1) fake quantization.</p>
-<dl class="simple">
-<dt>Single source of truth for FP4 decision-boundary rounding.  Used by:</dt><dd><ul class="simple">
-<li><p><code class="docutils literal notranslate"><span class="pre">fp4_kernel.py</span></code>         (standalone blockwise fake quant)</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">fp4_kernel_hopper.py</span></code>  (Hopper block-pointer variant)</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">gptq_fused_kernel.py</span></code>  (fused GPTQ scalar path)</p></li>
-</ul>
-</dd>
-</dl>
-<p>FP4 (E2M1) representable magnitudes: {0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0}</p>
+  <section id="common">
+<h1>common<a class="headerlink" href="#common" title="Link to this heading"></a></h1>
+<p class="rubric">Modules</p>
+<table class="autosummary longtable docutils align-default">
+<tbody>
+<tr class="row-odd"><td><p><a class="reference internal" href="modelopt.torch.kernels.quantization.common.fp8_quant.html#module-modelopt.torch.kernels.quantization.common.fp8_quant" title="modelopt.torch.kernels.quantization.common.fp8_quant"><code class="xref py py-obj docutils literal notranslate"><span class="pre">modelopt.torch.kernels.quantization.common.fp8_quant</span></code></a></p></td>
+<td><p>Composable Triton JIT functions for FP8 (E4M3) fake quantization.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="modelopt.torch.kernels.quantization.common.nvfp4_quant.html#module-modelopt.torch.kernels.quantization.common.nvfp4_quant" title="modelopt.torch.kernels.quantization.common.nvfp4_quant"><code class="xref py py-obj docutils literal notranslate"><span class="pre">modelopt.torch.kernels.quantization.common.nvfp4_quant</span></code></a></p></td>
+<td><p>Composable Triton JIT functions for NVFP4 (E2M1) fake quantization.</p></td>
+</tr>
+</tbody>
+</table>
+<p id="module-modelopt.torch.kernels.quantization.common">Shared composable Triton JIT fake-quantization functions.</p>
+<p>Format-level building blocks (FP8 E4M3, NVFP4/E2M1) reused across the gemm
+and attention kernel packages.</p>
 </section>
 
 
            </div>
           </div>
           <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
-        <a href="modelopt.torch.kernels.quantization.gemm.nvfp4_fp8_sweep.html" class="btn btn-neutral float-left" title="nvfp4_fp8_sweep" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
-        <a href="modelopt.torch.kernels.sparsity.html" class="btn btn-neutral float-right" title="sparsity" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+        <a href="modelopt.torch.kernels.quantization.attention.bmm2_qdq.html" class="btn btn-neutral float-left" title="bmm2_qdq" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="modelopt.torch.kernels.quantization.common.fp8_quant.html" class="btn btn-neutral float-right" title="fp8_quant" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
     </div>
 
   <hr/>

@@ -39,6 +39,7 @@ fp4\_kernel
    
       compute_fp4_scales
       fp4_dequantize
+      static_blockwise_fp4_cast
       static_blockwise_fp4_fake_quant
    
    
