@@ -31,6 +31,11 @@ qad:
   # The teacher is always an unquantized, frozen Diffusers model.
   teacher_model_name_or_path: Qwen/Qwen-Image
 
+  # Flash samples only its four deployed transformer-evaluation timesteps.
+  # Set schedule=qwen_image for full-range logit-normal/uniform QAD instead.
+  timestep:
+    schedule: qwen_image_flash
+
   # weight=1.0 is pure teacher-output MSE; the flow-matching task weight is 0.
   output_loss:
     type: mse
@@ -74,7 +79,7 @@ flow_matching:
   logit_mean: 0.0
   logit_std: 1.0
   flow_shift: 3.0
-  mix_uniform_ratio: 0.1
+  mix_uniform_ratio: 0.0
   use_sigma_noise: true
   sigma_min: 0.0
   sigma_max: 1.0

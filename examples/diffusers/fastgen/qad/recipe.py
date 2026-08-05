@@ -29,7 +29,6 @@ import os
 from typing import Any
 
 import torch
-import wandb
 import yaml
 from torch import nn
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -37,6 +36,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 import modelopt.torch.distill as mtd
 import modelopt.torch.opt as mto
 import modelopt.torch.quantization as mtq
+import wandb
 from modelopt.torch.quantization.nn import TensorQuantizer
 
 try:
@@ -62,7 +62,7 @@ from fastgen_checkpoint import make_optimizer_partial_load_tolerant
 
 from .artifacts import StudentSettings, patch_student_build
 from .modeling import build_distillation_controller, clear_captured_outputs
-from .pipeline import QADPipeline
+from .pipeline import QADPipeline, configure_qad_timestep_sampling
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -104,6 +104,15 @@ class QADDiffusionRecipe(TrainDiffusionRecipe):
             raise ValueError("QAD supports model.mode=finetune only.")
         if self.cfg.get("ddp", None) is not None:
             raise ValueError("QAD currently supports AutoModel FSDP2, not DDP.")
+        fsdp = _as_dict(self.cfg.get("fsdp"))
+        model_parallel_sizes = {
+            name: int(fsdp.get(name, 1)) for name in ("tp_size", "cp_size", "pp_size")
+        }
+        if any(size != 1 for size in model_parallel_sizes.values()):
+            raise ValueError(
+                "QAD currently supports data-parallel FSDP2 only; "
+                f"found model parallel sizes {model_parallel_sizes}."
+            )
 
         # Diffusers' ModelMixin must be patched before from_pretrained so both
         # regular NVFP4 and SVDQuant bundles rebuild their ModelOpt topology and
@@ -117,6 +126,12 @@ class QADDiffusionRecipe(TrainDiffusionRecipe):
         # train/eval boundary because the controller delegate intentionally does
         # not register the live FSDP module as a child.
         self.model.train()
+
+        timestep_summary = configure_qad_timestep_sampling(
+            self.flow_matching_pipeline,
+            student_model_name_or_path=settings.model_name_or_path,
+            timestep_config=loss_config["timestep_config"],
+        )
 
         # Parent checkpoint restore established the exact next-step RNG state.
         # Teacher construction/sharding is transient setup and must not perturb
@@ -155,6 +170,7 @@ class QADDiffusionRecipe(TrainDiffusionRecipe):
             )
             object.__setattr__(self, "_qad_student_settings", settings)
             object.__setattr__(self, "_qad_loss_config", loss_config)
+            object.__setattr__(self, "_qad_timestep_summary", timestep_summary)
 
             tracked = self.__dict__.get("__state_tracked", set())
             forbidden = {"_qad_teacher", "_qad_controller", "_qad_pipeline"} & set(tracked)
@@ -180,6 +196,42 @@ class QADDiffusionRecipe(TrainDiffusionRecipe):
             )
             logging.info("[QAD] student quantizer summary:")
             mtq.print_quant_summary(self.model)
+            logging.info("[QAD] timestep sampling: %s", timestep_summary)
+
+    @staticmethod
+    def _resolve_timestep_config(
+        qad: dict[str, Any],
+        flow_matching: dict[str, Any],
+    ) -> dict[str, Any]:
+        timestep = _as_dict(qad.get("timestep"))
+        schedule = str(timestep.get("schedule", "")).lower()
+        if schedule not in {"qwen_image", "qwen_image_flash"}:
+            raise ValueError("qad.timestep.schedule must be qwen_image or qwen_image_flash.")
+
+        config: dict[str, Any] = {"schedule": schedule}
+        if schedule == "qwen_image_flash":
+            config["num_inference_steps"] = 4
+            return config
+
+        sampling = str(flow_matching.get("timestep_sampling", "logit_normal")).lower()
+        if sampling not in {"logit_normal", "uniform"}:
+            raise ValueError(
+                "Qwen-Image QAD supports full-range timestep_sampling=logit_normal or uniform."
+            )
+        config.update(
+            {
+                "timestep_sampling": sampling,
+                "logit_mean": float(flow_matching.get("logit_mean", 0.0)),
+                "logit_std": float(flow_matching.get("logit_std", 1.0)),
+                "flow_shift": float(flow_matching.get("flow_shift", 3.0)),
+                "mix_uniform_ratio": float(flow_matching.get("mix_uniform_ratio", 0.1)),
+                "use_sigma_noise": bool(flow_matching.get("use_sigma_noise", True)),
+                "sigma_min": float(flow_matching.get("sigma_min", 0.0)),
+                "sigma_max": float(flow_matching.get("sigma_max", 1.0)),
+                "num_train_timesteps": int(flow_matching.get("num_train_timesteps", 1000)),
+            }
+        )
+        return config
 
     def _resolve_qad_config(self) -> tuple[StudentSettings, dict[str, Any]]:
         qad = _as_dict(self.cfg.get("qad", None))
@@ -228,6 +280,11 @@ class QADDiffusionRecipe(TrainDiffusionRecipe):
         if not teacher_model_name_or_path:
             raise ValueError("qad.teacher_model_name_or_path is required.")
 
+        timestep_config = self._resolve_timestep_config(
+            qad,
+            _as_dict(self.cfg.get("flow_matching", {})),
+        )
+
         output_cfg = _as_dict(qad.get("output_loss"))
         if str(output_cfg.get("type", "mse")).lower() != "mse":
             raise ValueError("QAD currently supports only output_loss.type=mse.")
@@ -256,6 +313,7 @@ class QADDiffusionRecipe(TrainDiffusionRecipe):
             "output_weight": output_weight,
             "task_weight": task_weight,
             "layer_pairs": layer_pairs,
+            "timestep_config": timestep_config,
         }
 
     @staticmethod
@@ -270,6 +328,7 @@ class QADDiffusionRecipe(TrainDiffusionRecipe):
             "teacher_source": loss_config["teacher_model_name_or_path"],
             "output_weight": float(loss_config["output_weight"]),
             "task_weight": float(loss_config["task_weight"]),
+            "timestep_config": loss_config["timestep_config"],
             "layer_pairs": tuple(
                 (
                     str(pair["student_layer"]),
@@ -300,6 +359,10 @@ class QADDiffusionRecipe(TrainDiffusionRecipe):
         output_cfg = _as_dict(qad_cfg.get("output_loss"))
         task_cfg = _as_dict(qad_cfg.get("task_loss"))
         layerwise_cfg = _as_dict(qad_cfg.get("layerwise"))
+        timestep_config = cls._resolve_timestep_config(
+            qad_cfg,
+            _as_dict(config.get("flow_matching")),
+        )
 
         mode = str(student_cfg.get("mode", "nvfp4")).lower()
         if mode == "svdquant_nvfp4":
@@ -310,6 +373,7 @@ class QADDiffusionRecipe(TrainDiffusionRecipe):
             "output_weight": float(output_cfg.get("weight", 1.0)),
             "task_weight": float(task_cfg.get("weight", 0.0)),
             "layer_pairs": [_as_dict(pair) for pair in raw_pairs],
+            "timestep_config": timestep_config,
         }
         settings = StudentSettings(
             mode=mode,

@@ -2,8 +2,8 @@
 
 This example trains a quantized diffusion student against a frozen, BF16
 Diffusers teacher with ModelOpt's distillation API. It is a standalone FastGen
-recipe: it does not use DMD2, reduce the sampling schedule, create a fake-score
-model, or add a GAN/EMA training phase.
+recipe: it does not run DMD2, create a fake-score model, or add a GAN/EMA
+training phase.
 
 The initial Qwen-Image recipe uses the official `Qwen/Qwen-Image` Diffusers
 checkpoint as the teacher. Set `qad.teacher_model_name_or_path` to
@@ -12,9 +12,32 @@ should be the teacher instead. Both follow the standard Diffusers checkpoint
 interface. QAD intentionally does not interpret FastGen/DMD2 intermediate
 checkpoint sidecars or standalone transformer safetensors as teacher inputs.
 
-Every training micro-batch samples one noisy latent and one timestep, then sends
-the same latent, timestep, prompt conditioning, and guidance inputs to the
-teacher and student.
+Every training micro-batch sends the same noisy latent, timestep, prompt
+conditioning, and guidance inputs to the teacher and student. Timestep sampling
+follows the quantized student's deployment schedule, independently of which BF16
+teacher is selected.
+
+## Timestep schedules
+
+`qad.timestep.schedule` is separate from the student's quantization mode:
+
+- `qwen_image_flash` is the default in the provided configs. The recipe reads the
+  scheduler from the complete student bundle and reproduces QwenImagePipeline's
+  four-step construction. It uniformly samples only model timesteps
+  `[1000, 900, 750, 500]`, corresponding to shifted sigmas
+  `[1.0, 0.9, 0.75, 0.5]`. The terminal sigma `0.0` is validated but never
+  sampled because the transformer is not evaluated there. A dynamic-shift
+  original Qwen-Image scheduler is rejected in this mode.
+- `qwen_image` preserves full-range flow-matching sampling for an original
+  Qwen-Image student. Set `flow_matching.timestep_sampling` to `logit_normal` or
+  `uniform`. Both use AutoModel's configured flow shift; set
+  `flow_matching.use_sigma_noise=false` for uniform sampling directly in sigma
+  space. A static shift-3 Flash scheduler is rejected in this mode.
+
+The Flash path intentionally mirrors QwenImagePipeline's raw-sigma construction;
+calling `scheduler.set_timesteps(4)` directly produces a different schedule.
+Both paths currently form inputs by forward-noising real latents at the sampled
+timestep. Trajectory-state rollout is a separate extension.
 
 ## Supported students
 
@@ -185,6 +208,7 @@ EXTRA_ARGS="--step_scheduler.max_steps=50000 \
 --lr_scheduler.min_lr=2e-6 \
 --fsdp.dp_size=64 \
 --qad.teacher_model_name_or_path=Qwen/Qwen-Image \
+--qad.timestep.schedule=qwen_image_flash \
 --qad.output_loss.weight=1.0 \
 --qad.task_loss.weight=0.0 \
 --qad.student.mode=nvfp4_svdquant \
@@ -206,7 +230,8 @@ launcher still hard-codes `dmd2_finetune.py`.
 
 The launch environment contains no Attention Grill settings. It also contains
 no DMD2 timestep, fake-score, discriminator, negative-prompt, GAN, or EMA
-settings.
+settings. QAD currently requires `fsdp.tp_size=1`, `fsdp.cp_size=1`, and
+`fsdp.pp_size=1`; data parallelism is controlled through `fsdp.dp_size`.
 
 ## Restore and checkpoint invariants
 
