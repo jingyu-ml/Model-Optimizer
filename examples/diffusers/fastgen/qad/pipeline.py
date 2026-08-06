@@ -24,7 +24,7 @@ import torch
 from diffusers import DiffusionPipeline, FlowMatchEulerDiscreteScheduler
 from torch import nn
 
-from .modeling import clear_captured_outputs
+from .modeling import DistillationLossLayout, clear_captured_outputs
 
 __all__ = ["QADPipeline", "configure_qad_timestep_sampling"]
 
@@ -186,10 +186,15 @@ def configure_qad_timestep_sampling(
 class QADPipeline:
     """Run teacher/student on identical inputs and aggregate ModelOpt KD losses."""
 
-    def __init__(self, flow_matching_pipeline, controller: nn.Module, loss_names: tuple[str, ...]):
+    def __init__(
+        self,
+        flow_matching_pipeline,
+        controller: nn.Module,
+        loss_layout: DistillationLossLayout,
+    ):
         self.flow_matching_pipeline = flow_matching_pipeline
         self.controller = controller
-        self.loss_names = loss_names
+        self.loss_layout = loss_layout
 
     def step(
         self,
@@ -220,12 +225,23 @@ class QADPipeline:
             raise FloatingPointError(f"Non-finite QAD loss at step {global_step}.")
 
         kd_values = [value for key, value in losses.items() if key != "student_loss"]
-        if len(kd_values) != len(self.loss_names):
+        if len(kd_values) != len(self.loss_layout.names):
             raise RuntimeError(
                 "QAD loss-name mapping is out of sync with ModelOpt's returned losses."
             )
         metrics = {"task_loss": task_loss.detach(), "total_loss": total.detach()}
-        metrics.update({name: value.detach() for name, value in zip(self.loss_names, kd_values)})
+        blockwise_positions = set(self.loss_layout.blockwise_positions)
+        for position, (name, value) in enumerate(zip(self.loss_layout.names, kd_values)):
+            if position not in blockwise_positions or self.loss_layout.log_per_block:
+                metrics[name] = value.detach()
+
+        if blockwise_positions:
+            metric_name = self.loss_layout.blockwise_metric_name
+            if metric_name is None:
+                raise RuntimeError("QAD blockwise losses have no aggregate metric name.")
+            metrics[metric_name] = torch.stack(
+                [kd_values[position].detach() for position in self.loss_layout.blockwise_positions]
+            ).mean()
         return total, metrics
 
     def clear(self) -> None:

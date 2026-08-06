@@ -36,7 +36,7 @@ qad:
   timestep:
     schedule: qwen_image_flash
 
-  # weight=1.0 is pure teacher-output MSE; the flow-matching task weight is 0.
+  # Final-output MSE remains an independent weight-1 objective component.
   output_loss:
     type: mse
     weight: 1.0
@@ -45,10 +45,22 @@ qad:
   task_loss:
     weight: 0.0
 
-  # Layer pairs use exact module names relative to each transformer.
+  # Match every transformer block that contains an enabled student weight
+  # quantizer. The 56 selected Qwen blocks are averaged as one loss group.
   layerwise:
-    enabled: false
-    pairs: []
+    enabled: true
+    selection: quantized_blocks
+    # Cosine is scale-stable when an original Qwen teacher supervises a
+    # DMD2-trained Flash student. Weight 3 makes this group slightly dominant.
+    type: cosine
+    weight: 3.0
+    reduction: mean
+    streams:
+      - selector: encoder_hidden_states
+        weight: 0.2
+      - selector: hidden_states
+        weight: 0.8
+    log_per_block: false
 
   student:
     mode: nvfp4
@@ -105,7 +117,8 @@ checkpoint:
   enabled: true
   checkpoint_dir: /path/to/output/qwen_image_qad_nvfp4/checkpoints
   model_save_format: safetensors
-  # Save full sharded student DCP. Deployment export is a separate operation.
-  save_consolidated: false
-  diffusers_compatible: false
+  # Keep sharded DCP state for resume and also emit a Diffusers-compatible
+  # consolidated transformer checkpoint for inference-bundle assembly.
+  save_consolidated: true
+  diffusers_compatible: true
   restore_from: LATEST

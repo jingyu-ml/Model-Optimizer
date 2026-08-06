@@ -81,6 +81,7 @@ class StudentBuildState:
 
     parallel_scheme: dict[str, dict[str, Any]] | None = None
     quantizer_count: int = 0
+    quantized_block_indices: tuple[int, ...] = ()
     svdquant_parameter_names: tuple[str, ...] = ()
 
 
@@ -157,6 +158,34 @@ def _validate_nvfp4_quantizers(
         len(enabled_by_slot["weight"]),
         len(enabled_by_slot["input"]),
     )
+
+
+def _find_quantized_transformer_blocks(model: nn.Module) -> tuple[int, ...]:
+    """Return blocks containing at least one enabled weight quantizer."""
+    blocks = getattr(model, "transformer_blocks", None)
+    if blocks is None:
+        raise RuntimeError("The QAD student does not expose transformer_blocks.")
+
+    indices = tuple(
+        index
+        for index, block in enumerate(blocks)
+        if any(
+            isinstance(module, TensorQuantizer)
+            and module.is_enabled
+            and "weight_quantizer" in name.split(".")
+            for name, module in block.named_modules()
+        )
+    )
+    if not indices:
+        raise RuntimeError(
+            "The QAD student has no transformer block with an enabled weight quantizer."
+        )
+    logging.info(
+        "[QAD] discovered %d quantized transformer blocks before FSDP: %s",
+        len(indices),
+        ",".join(str(index) for index in indices),
+    )
+    return indices
 
 
 def _modelopt_mode_states(model: nn.Module) -> dict[str, dict[str, Any]]:
@@ -376,6 +405,7 @@ def patch_student_build(
             state.quantizer_count = sum(
                 isinstance(module, TensorQuantizer) for module in transformer.modules()
             )
+        state.quantized_block_indices = _find_quantized_transformer_blocks(transformer)
         return original_apply_parallelization(pipe, parallel_scheme)
 
     def build_model_and_optimizer(**kwargs):

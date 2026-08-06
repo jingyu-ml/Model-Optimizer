@@ -153,32 +153,70 @@ qad:
     weight: 0.0
 ```
 
-At `weight: 1.0`, the optimized objective is pure teacher-output MSE and the
-ordinary flow-matching target has weight zero because `task_loss.weight` defaults
-to `0.0`. All coefficients are independent and additive. For example, setting
-both output and task weights to `0.5` produces an equal output-MSE/flow-matching
-mixture; adding layerwise terms does not silently renormalize either coefficient.
+With layerwise distillation disabled, `output_loss.weight: 1.0` and
+`task_loss.weight: 0.0` optimize pure teacher-output MSE. All top-level
+coefficients are independent and additive; enabling blockwise loss does not
+silently renormalize the final-output coefficient.
 
-Optional layerwise MSE can be added without changing the output loss:
+The provided configs automatically target every student transformer block that
+contains at least one enabled ModelOpt weight quantizer:
 
 ```yaml
 qad:
   layerwise:
     enabled: true
-    pairs:
-      - student_layer: transformer_blocks.29
-        teacher_layer: transformer_blocks.29
-        selector: hidden_states
-        weight: 0.05
+    selection: quantized_blocks
+    type: cosine              # cosine is the cross-model default; mse remains available
+    weight: 3.0
+    reduction: mean
+    streams:
+      - selector: encoder_hidden_states
+        weight: 0.2
+      - selector: hidden_states
+        weight: 0.8
+    log_per_block: false
 ```
 
-Each pair is an exact module name relative to the student or teacher
-transformer. Its weight is additive to the output/task objective. Start with
-output-only training: layer hooks retain activations and therefore increase
-memory use, especially when activation checkpointing is enabled.
+For every selected block `i`, the Qwen text and image outputs are reduced
+independently before weighting:
 
-The recipe logs the flow-matching loss, output MSE, every configured layerwise
-MSE, and the final combined loss separately.
+```text
+L_block_i = 0.2 * L_text_i + 0.8 * L_image_i
+L_block = mean_i(L_block_i)
+L_total = output_weight * L_output + layerwise_weight * L_block
+          + task_weight * L_task
+```
+
+MSE averages all elements in each stream. Cosine computes `1 - cosine` along
+the hidden dimension and then averages batch/token positions. Because each
+stream is reduced independently, the larger image tensor does not implicitly
+receive more weight; `0.8` is an explicit image-priority coefficient. Stream
+weights must sum to `1.0`.
+
+For an original Qwen-Image teacher and a DMD2-trained Flash student, intermediate
+residual magnitudes are not aligned: a smoke run measured plain block MSE around
+`1.49e13` while final-output MSE was `0.052`. The provided configs therefore use
+scale-invariant cosine loss. With the measured cosine block mean of `0.0308`,
+`output_loss.weight=1.0` and `layerwise.weight=3.0` make blockwise supervision
+slightly dominant (roughly 55% of the scalar objective in that sample). Plain
+MSE remains useful when teacher and student representations are already aligned,
+such as a BF16 Flash teacher and its directly quantized Flash student.
+
+Block selection is resolved from the restored live student before FSDP and is
+not hard-coded to a Qwen layer range. For the current Qwen-Image NVFP4 recipes,
+this selects blocks 2 through 57. The student and teacher must expose the same
+number of transformer blocks. The layerwise group weight is divided by the
+number of selected blocks, so adding 56 hooks does not multiply its objective
+scale by 56.
+
+Set `log_per_block: true` for a short verification run; normal training logs
+only the block mean. The older exact-module `pairs` form remains supported and
+is mutually exclusive with `selection: quantized_blocks`; each explicit pair
+uses its own `weight` rather than the block-group weight shown above.
+
+The recipe logs flow-matching loss, output MSE, aggregate blockwise loss, and
+the final combined loss separately. Layer hooks retain activations and increase
+memory use, especially when activation checkpointing is enabled.
 
 ## Configuration and launch
 
@@ -211,6 +249,8 @@ EXTRA_ARGS="--step_scheduler.max_steps=50000 \
 --qad.timestep.schedule=qwen_image_flash \
 --qad.output_loss.weight=1.0 \
 --qad.task_loss.weight=0.0 \
+--qad.layerwise.type=cosine \
+--qad.layerwise.weight=3.0 \
 --qad.student.mode=nvfp4_svdquant \
 --model.pretrained_model_name_or_path=/path/to/qwen-image-nvfp4-svdquant-training-bundle \
 --qad.student.train_scope=all \
@@ -248,3 +288,8 @@ global-step state. Resolved dotted CLI overrides are materialized into the saved
 `config.yaml`. Resume validates the student bundle, quantization mode, train
 scope, teacher, and loss configuration before loading optimizer shards; do not
 change them while resuming an existing run.
+
+The provided YAML files now enable blockwise loss by default. To resume an older
+output-only checkpoint with the same objective, explicitly pass
+`--qad.layerwise.enabled=false`; otherwise the resume signature intentionally
+rejects the changed loss contract.

@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -91,6 +92,16 @@ def register_qwen_image_parallelization_strategy() -> None:
 register_qwen_image_parallelization_strategy()
 
 
+@dataclasses.dataclass(frozen=True)
+class DistillationLossLayout:
+    """Names and grouping for ModelOpt's insertion-ordered KD loss dictionary."""
+
+    names: tuple[str, ...]
+    blockwise_positions: tuple[int, ...] = ()
+    blockwise_metric_name: str | None = None
+    log_per_block: bool = False
+
+
 def _extract_tensor(output: Any, selector: str) -> torch.Tensor:
     """Select a tensor from a Diffusers root or Qwen dual-stream block output."""
     normalized = selector.lower()
@@ -155,17 +166,56 @@ class TensorOutputDelegate(nn.Module):
         return self.target.get_submodule(target)
 
 
-class SelectedMSELoss(nn.modules.loss._Loss):
-    """FP32 MSE after selecting a stream from a captured layer output."""
+def _tensor_distance(
+    student: torch.Tensor,
+    teacher: torch.Tensor,
+    loss_type: str,
+) -> torch.Tensor:
+    student_fp32 = student.float()
+    teacher_fp32 = teacher.float()
+    if loss_type == "mse":
+        return F.mse_loss(student_fp32, teacher_fp32, reduction="mean")
+    if loss_type == "cosine":
+        return (1.0 - F.cosine_similarity(student_fp32, teacher_fp32, dim=-1)).mean()
+    raise ValueError(f"Unsupported QAD representation loss type: {loss_type!r}.")
 
-    def __init__(self, selector: str = "sample"):
+
+class SelectedTensorLoss(nn.modules.loss._Loss):
+    """FP32 MSE or cosine loss after selecting one captured output stream."""
+
+    def __init__(self, selector: str = "sample", loss_type: str = "mse"):
         super().__init__(reduction="mean")
         self.selector = selector
+        self.loss_type = loss_type
 
     def forward(self, student_output: Any, teacher_output: Any) -> torch.Tensor:
         student = _extract_tensor(student_output, self.selector)
         teacher = _extract_tensor(teacher_output, self.selector)
-        return F.mse_loss(student.float(), teacher.float(), reduction="mean")
+        return _tensor_distance(student, teacher, self.loss_type)
+
+
+class WeightedStreamLoss(nn.modules.loss._Loss):
+    """Weighted Qwen text/image representation loss for one transformer block."""
+
+    def __init__(self, *, loss_type: str, streams: Sequence[dict[str, Any]]):
+        super().__init__(reduction="mean")
+        self.loss_type = loss_type
+        self.streams = tuple(
+            (str(stream["selector"]), float(stream["weight"])) for stream in streams
+        )
+
+    def forward(self, student_output: Any, teacher_output: Any) -> torch.Tensor:
+        total = None
+        for selector, weight in self.streams:
+            if weight == 0.0:
+                continue
+            student = _extract_tensor(student_output, selector)
+            teacher = _extract_tensor(teacher_output, selector)
+            weighted_loss = _tensor_distance(student, teacher, self.loss_type) * weight
+            total = weighted_loss if total is None else total + weighted_loss
+        if total is None:
+            raise RuntimeError("QAD weighted-stream loss has no nonzero stream coefficient.")
+        return total
 
 
 class AdditiveLossBalancer(mtd.DistillationLossBalancer):
@@ -211,15 +261,57 @@ def build_distillation_controller(
     teacher: nn.Module,
     output_weight: float,
     task_weight: float,
-    layer_pairs: Sequence[dict[str, Any]],
-) -> tuple[nn.Module, tuple[str, ...]]:
+    layerwise_config: dict[str, Any],
+    quantized_block_indices: Sequence[int],
+) -> tuple[nn.Module, DistillationLossLayout]:
     """Create a parameter-free ModelOpt KD controller around live FSDP models."""
-    criterion: dict[tuple[str, str], nn.modules.loss._Loss] = {("", ""): SelectedMSELoss("sample")}
+    criterion: dict[tuple[str, str], nn.modules.loss._Loss] = {
+        ("", ""): SelectedTensorLoss("sample", "mse")
+    }
     names = ["output_mse"]
     weights = [float(output_weight)]
     seen_pairs = {("", "")}
+    blockwise_positions: list[int] = []
+    blockwise_metric_name = None
 
-    for index, pair in enumerate(layer_pairs):
+    selection = layerwise_config.get("selection")
+    loss_type = str(layerwise_config.get("type", "mse"))
+    if selection == "quantized_blocks":
+        indices = tuple(int(index) for index in quantized_block_indices)
+        if not indices:
+            raise RuntimeError(
+                "qad.layerwise.selection=quantized_blocks resolved no quantized blocks."
+            )
+        student_blocks = getattr(student, "transformer_blocks", None)
+        teacher_blocks = getattr(teacher, "transformer_blocks", None)
+        if student_blocks is None or teacher_blocks is None:
+            raise RuntimeError(
+                "Blockwise QAD requires transformer_blocks on both student and teacher."
+            )
+        if len(student_blocks) != len(teacher_blocks):
+            raise RuntimeError(
+                "Blockwise QAD requires matching student/teacher block counts, found "
+                f"{len(student_blocks)} and {len(teacher_blocks)}."
+            )
+        invalid_indices = [index for index in indices if not 0 <= index < len(student_blocks)]
+        if invalid_indices:
+            raise RuntimeError(
+                "Quantized block indices are outside the student/teacher topology: "
+                + ", ".join(str(index) for index in invalid_indices)
+            )
+
+        block_weight = float(layerwise_config["weight"]) / len(indices)
+        streams = layerwise_config["streams"]
+        for block_index in indices:
+            layer = f"transformer_blocks.{block_index}"
+            key = (layer, layer)
+            criterion[key] = WeightedStreamLoss(loss_type=loss_type, streams=streams)
+            names.append(f"block_{block_index}_{loss_type}")
+            weights.append(block_weight)
+            blockwise_positions.append(len(names) - 1)
+        blockwise_metric_name = f"blockwise_{loss_type}"
+
+    for index, pair in enumerate(layerwise_config.get("pairs", ())):
         student_layer = str(pair["student_layer"])
         teacher_layer = str(pair.get("teacher_layer", student_layer))
         selector = str(pair.get("selector", "hidden_states"))
@@ -228,8 +320,8 @@ def build_distillation_controller(
         if key in seen_pairs:
             raise ValueError(f"Duplicate QAD layer pair: {key!r}")
         seen_pairs.add(key)
-        criterion[key] = SelectedMSELoss(selector)
-        names.append(f"layer_{index}_{student_layer}_{selector}_mse")
+        criterion[key] = SelectedTensorLoss(selector, loss_type)
+        names.append(f"layer_{index}_{student_layer}_{selector}_{loss_type}")
         weights.append(weight)
 
     controller = mtd.convert(
@@ -249,7 +341,12 @@ def build_distillation_controller(
             )
         ],
     )
-    return controller, tuple(names)
+    return controller, DistillationLossLayout(
+        names=tuple(names),
+        blockwise_positions=tuple(blockwise_positions),
+        blockwise_metric_name=blockwise_metric_name,
+        log_per_block=bool(layerwise_config.get("log_per_block", False)),
+    )
 
 
 def clear_captured_outputs(controller: nn.Module) -> None:

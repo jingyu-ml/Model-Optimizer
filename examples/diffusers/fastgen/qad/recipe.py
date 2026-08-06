@@ -18,7 +18,7 @@
 QAD is deliberately separate from DMD2: one frozen Diffusers teacher and one
 quantized student see the same noisy latent, timestep, and conditioning, and
 ModelOpt's standard ``kd_loss`` API supplies output and optional representation
-MSE losses.
+MSE or cosine losses.
 """
 
 from __future__ import annotations
@@ -71,6 +71,150 @@ def _as_dict(value: Any) -> dict[str, Any]:
     if hasattr(value, "to_dict"):
         return value.to_dict()
     return dict(value)
+
+
+def _resolve_layerwise_config(layerwise: dict[str, Any]) -> dict[str, Any]:
+    supported_keys = {
+        "enabled",
+        "selection",
+        "type",
+        "weight",
+        "reduction",
+        "streams",
+        "pairs",
+        "log_per_block",
+    }
+    unknown_keys = set(layerwise) - supported_keys
+    if unknown_keys:
+        raise ValueError("Unsupported qad.layerwise field(s): " + ", ".join(sorted(unknown_keys)))
+
+    enabled = bool(layerwise.get("enabled", False))
+    if not enabled:
+        return {
+            "enabled": False,
+            "selection": None,
+            "type": "mse",
+            "weight": 0.0,
+            "reduction": "mean",
+            "streams": (),
+            "pairs": (),
+            "log_per_block": False,
+        }
+
+    loss_type = str(layerwise.get("type", "mse")).lower()
+    if loss_type not in {"mse", "cosine"}:
+        raise ValueError("qad.layerwise.type must be mse or cosine.")
+
+    raw_pairs = tuple(_as_dict(pair) for pair in layerwise.get("pairs", ()))
+    raw_selection = layerwise.get("selection")
+    selection = str(raw_selection).lower() if raw_selection is not None else None
+    if selection is not None and raw_pairs:
+        raise ValueError("qad.layerwise.selection and qad.layerwise.pairs are mutually exclusive.")
+    if selection is None and not raw_pairs:
+        raise ValueError(
+            "Enabled qad.layerwise requires selection=quantized_blocks or explicit pairs."
+        )
+
+    if selection is None:
+        auto_only_keys = {"weight", "reduction", "streams", "log_per_block"} & set(layerwise)
+        if auto_only_keys:
+            raise ValueError(
+                "Explicit qad.layerwise.pairs use each pair's own weight and do not accept: "
+                + ", ".join(sorted(auto_only_keys))
+            )
+        pairs = []
+        for index, pair in enumerate(raw_pairs):
+            unknown_pair_keys = set(pair) - {
+                "student_layer",
+                "teacher_layer",
+                "selector",
+                "weight",
+            }
+            if unknown_pair_keys:
+                raise ValueError(
+                    f"Unsupported qad.layerwise.pairs[{index}] field(s): "
+                    + ", ".join(sorted(unknown_pair_keys))
+                )
+            student_layer = pair.get("student_layer")
+            if not student_layer:
+                raise ValueError(f"qad.layerwise.pairs[{index}].student_layer is required.")
+            pairs.append(
+                {
+                    "student_layer": str(student_layer),
+                    "teacher_layer": str(pair.get("teacher_layer", student_layer)),
+                    "selector": str(pair.get("selector", "hidden_states")),
+                    "weight": float(pair.get("weight", 1.0)),
+                }
+            )
+        return {
+            "enabled": True,
+            "selection": None,
+            "type": loss_type,
+            "weight": 0.0,
+            "reduction": "mean",
+            "streams": (),
+            "pairs": tuple(pairs),
+            "log_per_block": False,
+        }
+
+    if selection != "quantized_blocks":
+        raise ValueError("qad.layerwise.selection must be quantized_blocks.")
+    reduction = str(layerwise.get("reduction", "mean")).lower()
+    if reduction != "mean":
+        raise ValueError("qad.layerwise.reduction currently supports only mean.")
+
+    default_streams = (
+        {"selector": "encoder_hidden_states", "weight": 0.2},
+        {"selector": "hidden_states", "weight": 0.8},
+    )
+    selector_aliases = {
+        "text": "encoder_hidden_states",
+        "encoder_hidden_states": "encoder_hidden_states",
+        "image": "hidden_states",
+        "hidden_states": "hidden_states",
+    }
+    streams: list[dict[str, Any]] = []
+    for index, stream in enumerate(layerwise.get("streams", default_streams)):
+        stream = _as_dict(stream)
+        unknown_stream_keys = set(stream) - {"selector", "weight"}
+        if unknown_stream_keys:
+            raise ValueError(
+                f"Unsupported qad.layerwise.streams[{index}] field(s): "
+                + ", ".join(sorted(unknown_stream_keys))
+            )
+        selector = str(stream.get("selector", "")).lower()
+        if selector not in selector_aliases:
+            raise ValueError(
+                f"qad.layerwise.streams[{index}].selector must identify the Qwen text "
+                "or image stream."
+            )
+        streams.append(
+            {
+                "selector": selector_aliases[selector],
+                "weight": float(stream.get("weight", 0.0)),
+            }
+        )
+    if not streams:
+        raise ValueError("qad.layerwise.streams must contain at least one stream.")
+    selectors = [stream["selector"] for stream in streams]
+    if len(selectors) != len(set(selectors)):
+        raise ValueError("qad.layerwise.streams contains a duplicate text/image stream.")
+    stream_weights = [float(stream["weight"]) for stream in streams]
+    if any(not math.isfinite(weight) or weight < 0.0 for weight in stream_weights):
+        raise ValueError("QAD stream weights must be finite and non-negative.")
+    if not math.isclose(sum(stream_weights), 1.0, rel_tol=0.0, abs_tol=1e-8):
+        raise ValueError("qad.layerwise.stream weights must sum to 1.0.")
+
+    return {
+        "enabled": True,
+        "selection": selection,
+        "type": loss_type,
+        "weight": float(layerwise.get("weight", 1.0)),
+        "reduction": reduction,
+        "streams": tuple(streams),
+        "pairs": (),
+        "log_per_block": bool(layerwise.get("log_per_block", False)),
+    }
 
 
 class QADDiffusionRecipe(TrainDiffusionRecipe):
@@ -145,12 +289,13 @@ class QADDiffusionRecipe(TrainDiffusionRecipe):
                 loss_config["teacher_model_name_or_path"],
                 parallel_scheme,
             )
-            controller, loss_names = build_distillation_controller(
+            controller, loss_layout = build_distillation_controller(
                 student=self.model,
                 teacher=teacher,
                 output_weight=loss_config["output_weight"],
                 task_weight=loss_config["task_weight"],
-                layer_pairs=loss_config["layer_pairs"],
+                layerwise_config=loss_config["layerwise_config"],
+                quantized_block_indices=build_state.quantized_block_indices,
             )
             if any(True for _ in controller.parameters()):
                 raise RuntimeError(
@@ -166,7 +311,7 @@ class QADDiffusionRecipe(TrainDiffusionRecipe):
             object.__setattr__(
                 self,
                 "_qad_pipeline",
-                QADPipeline(self.flow_matching_pipeline, controller, loss_names),
+                QADPipeline(self.flow_matching_pipeline, controller, loss_layout),
             )
             object.__setattr__(self, "_qad_student_settings", settings)
             object.__setattr__(self, "_qad_loss_config", loss_config)
@@ -185,15 +330,21 @@ class QADDiffusionRecipe(TrainDiffusionRecipe):
         if is_main_process():
             logging.info(
                 "[QAD] initialized: teacher=%s student=%s mode=%s train_scope=%s "
-                "task_weight=%g output_weight=%g layer_pairs=%d",
+                "task_weight=%g output_weight=%g layerwise=%s",
                 loss_config["teacher_model_name_or_path"],
                 settings.model_name_or_path,
                 settings.mode,
                 settings.train_scope,
                 loss_config["task_weight"],
                 loss_config["output_weight"],
-                len(loss_config["layer_pairs"]),
+                loss_config["layerwise_config"],
             )
+            if loss_config["layerwise_config"]["selection"] == "quantized_blocks":
+                logging.info(
+                    "[QAD] blockwise distillation targets %d discovered blocks: %s",
+                    len(build_state.quantized_block_indices),
+                    ",".join(str(index) for index in build_state.quantized_block_indices),
+                )
             logging.info("[QAD] student quantizer summary:")
             mtq.print_quant_summary(self.model)
             logging.info("[QAD] timestep sampling: %s", timestep_summary)
@@ -293,28 +444,53 @@ class QADDiffusionRecipe(TrainDiffusionRecipe):
         task_cfg = _as_dict(qad.get("task_loss"))
         task_weight = float(task_cfg.get("weight", 0.0))
 
-        layerwise_cfg = _as_dict(qad.get("layerwise"))
-        layer_pairs = layerwise_cfg.get("pairs", []) if layerwise_cfg.get("enabled", False) else []
-        layer_pairs = [_as_dict(pair) for pair in layer_pairs]
+        layerwise_config = _resolve_layerwise_config(_as_dict(qad.get("layerwise")))
+        layerwise_weights = [float(pair["weight"]) for pair in layerwise_config["pairs"]]
+        if layerwise_config["selection"] == "quantized_blocks":
+            layerwise_weights.append(float(layerwise_config["weight"]))
 
-        all_weights = [output_weight, task_weight] + [
-            float(pair.get("weight", 1.0)) for pair in layer_pairs
-        ]
+        all_weights = [output_weight, task_weight, *layerwise_weights]
         if any(not math.isfinite(weight) or weight < 0.0 for weight in all_weights):
             raise ValueError("QAD loss weights must be finite and non-negative.")
         if not any(weight > 0.0 for weight in all_weights):
             raise ValueError("At least one QAD loss weight must be positive.")
-        for index, pair in enumerate(layer_pairs):
-            if not pair.get("student_layer"):
-                raise ValueError(f"qad.layerwise.pairs[{index}].student_layer is required.")
 
         return settings, {
             "teacher_model_name_or_path": str(teacher_model_name_or_path),
             "output_weight": output_weight,
             "task_weight": task_weight,
-            "layer_pairs": layer_pairs,
+            "layerwise_config": layerwise_config,
             "timestep_config": timestep_config,
         }
+
+    @staticmethod
+    def _layerwise_resume_signature(layerwise: dict[str, Any]) -> tuple[Any, ...]:
+        if not layerwise["enabled"]:
+            return ("disabled",)
+        if layerwise["selection"] == "quantized_blocks":
+            return (
+                "quantized_blocks",
+                str(layerwise["type"]),
+                float(layerwise["weight"]),
+                str(layerwise["reduction"]),
+                tuple(
+                    (str(stream["selector"]), float(stream["weight"]))
+                    for stream in layerwise["streams"]
+                ),
+            )
+        return (
+            "pairs",
+            str(layerwise["type"]),
+            tuple(
+                (
+                    str(pair["student_layer"]),
+                    str(pair["teacher_layer"]),
+                    str(pair["selector"]),
+                    float(pair["weight"]),
+                )
+                for pair in layerwise["pairs"]
+            ),
+        )
 
     @staticmethod
     def _resume_signature(
@@ -329,14 +505,8 @@ class QADDiffusionRecipe(TrainDiffusionRecipe):
             "output_weight": float(loss_config["output_weight"]),
             "task_weight": float(loss_config["task_weight"]),
             "timestep_config": loss_config["timestep_config"],
-            "layer_pairs": tuple(
-                (
-                    str(pair["student_layer"]),
-                    str(pair.get("teacher_layer", pair["student_layer"])),
-                    str(pair.get("selector", "hidden_states")),
-                    float(pair.get("weight", 1.0)),
-                )
-                for pair in loss_config["layer_pairs"]
+            "layerwise": QADDiffusionRecipe._layerwise_resume_signature(
+                loss_config["layerwise_config"]
             ),
         }
 
@@ -367,12 +537,11 @@ class QADDiffusionRecipe(TrainDiffusionRecipe):
         mode = str(student_cfg.get("mode", "nvfp4")).lower()
         if mode == "svdquant_nvfp4":
             mode = "nvfp4_svdquant"
-        raw_pairs = layerwise_cfg.get("pairs", []) if layerwise_cfg.get("enabled", False) else []
         loss_config = {
             "teacher_model_name_or_path": str(qad_cfg.get("teacher_model_name_or_path", "")),
             "output_weight": float(output_cfg.get("weight", 1.0)),
             "task_weight": float(task_cfg.get("weight", 0.0)),
-            "layer_pairs": [_as_dict(pair) for pair in raw_pairs],
+            "layerwise_config": _resolve_layerwise_config(layerwise_cfg),
             "timestep_config": timestep_config,
         }
         settings = StudentSettings(
