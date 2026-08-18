@@ -47,6 +47,7 @@ import json
 import logging
 import os
 import sys
+from collections.abc import Mapping
 
 import torch
 from models_utils import ModelType
@@ -60,12 +61,24 @@ import modelopt.torch.quantization as mtq
 logger = logging.getLogger("sanity_check_dmd2")
 
 
+def _jsonable_recipe(value):
+    """Materialize Attention Grill's immutable recipe mappings for JSON."""
+    if isinstance(value, Mapping):
+        return {key: _jsonable_recipe(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_jsonable_recipe(item) for item in value]
+    return value
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--quantized-ckpt",
-        required=True,
-        help="Path to the quantized checkpoint saved by quantize.py (e.g. .../transformer.pt).",
+        default=None,
+        help=(
+            "Optional quantizer-state checkpoint saved by quantize.py (e.g. "
+            ".../transformer.pt). Omit it for attention-only or BF16 ablations."
+        ),
     )
     parser.add_argument(
         "--student-path",
@@ -92,6 +105,25 @@ def main() -> None:
     )
     parser.add_argument("--sample-type", default="ode", choices=["ode", "sde"])
     parser.add_argument("--guidance-scale", type=float, default=1.0)
+    parser.add_argument(
+        "--attention-grill-recipe",
+        default=None,
+        help=(
+            "Optional Attention Grill recipe YAML. When set, install the selected "
+            "quantized attention backend after restoring the ModelOpt quantizer state."
+        ),
+    )
+    parser.add_argument(
+        "--attention-grill-ignore",
+        action="append",
+        default=None,
+        help=(
+            "fnmatch pattern for attention modules that Attention Grill must leave unchanged. "
+            "Repeat the option for multiple patterns."
+        ),
+    )
+    parser.add_argument("--attention-grill-expected-replaced", type=int, default=56)
+    parser.add_argument("--attention-grill-expected-ignored", type=int, default=4)
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -123,12 +155,53 @@ def main() -> None:
     pipe = pm.create_pipeline()
 
     # 2. Restore the quantized architecture + calibrated amax into the student.
-    logger.info(
-        "Restoring quantizer state (amax + recipe) from %s onto the loaded student",
-        args.quantized_ckpt,
-    )
-    restore_quantizer_state(pipe.transformer, args.quantized_ckpt)
-    mtq.print_quant_summary(pipe.transformer)
+    modelopt_quantized = args.quantized_ckpt is not None
+    if modelopt_quantized:
+        logger.info(
+            "Restoring quantizer state (amax + recipe) from %s onto the loaded student",
+            args.quantized_ckpt,
+        )
+        restore_quantizer_state(pipe.transformer, args.quantized_ckpt)
+        mtq.print_quant_summary(pipe.transformer)
+    else:
+        logger.info("ModelOpt quantizer restore disabled; keeping the student GEMMs in BF16")
+
+    attention_grill_stats = None
+    if args.attention_grill_recipe:
+        import attention_grill
+
+        ignore = args.attention_grill_ignore or []
+        logger.info(
+            "Installing Attention Grill recipe %s after ModelOpt restore (ignore=%s)",
+            args.attention_grill_recipe,
+            ignore,
+        )
+        report = attention_grill.replace(
+            pipe.transformer,
+            recipe=args.attention_grill_recipe,
+            ignore=ignore,
+        )
+        if len(report.replaced) != args.attention_grill_expected_replaced:
+            raise RuntimeError(
+                "Attention Grill replacement count mismatch: "
+                f"replaced={len(report.replaced)}, "
+                f"expected={args.attention_grill_expected_replaced}"
+            )
+        if len(report.ignored) != args.attention_grill_expected_ignored:
+            raise RuntimeError(
+                "Attention Grill ignored count mismatch: "
+                f"ignored={len(report.ignored)}, "
+                f"expected={args.attention_grill_expected_ignored}"
+            )
+        logger.info("Attention Grill installed: %s", report)
+        attention_grill_stats = {
+            "type": report.type,
+            "recipe_path": args.attention_grill_recipe,
+            "recipe": _jsonable_recipe(report.recipe),
+            "replaced": len(report.replaced),
+            "ignored": len(report.ignored),
+        }
+
     pm.setup_device()
 
     # 3. One few-step inference (with VAE decode).
@@ -141,8 +214,17 @@ def main() -> None:
     arr = np.asarray(image)
     stats = {
         "prompt": args.prompt,
+        "student_path": args.student_path,
         "quantized_ckpt": args.quantized_ckpt,
+        "modelopt_quantized": modelopt_quantized,
+        "attention_grill": attention_grill_stats,
         "schedule": pm.dmd_sampler_cfg["schedule"],
+        "sample_steps": args.sample_steps,
+        "sample_type": args.sample_type,
+        "guidance_scale": args.guidance_scale,
+        "seed": args.seed,
+        "height": args.height,
+        "width": args.width,
         "image_shape": list(arr.shape),
         "image_dtype": str(arr.dtype),
         "image_min": float(arr.min()),
@@ -166,7 +248,7 @@ def main() -> None:
         logger.error("Sanity check FAILED: image is constant (std == 0).")
         sys.exit(1)
     logger.info(
-        "Sanity check PASSED: restored quantized student produced a finite image -> %s",
+        "Sanity check PASSED: configured student produced a finite image -> %s",
         args.output_png,
     )
 

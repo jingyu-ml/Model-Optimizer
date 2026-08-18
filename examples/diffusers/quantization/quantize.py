@@ -170,9 +170,10 @@ class Quantizer:
 
         # Apply the transformer-block-range recipe (e.g. Qwen-Image) BEFORE
         # calibration. This restricts quantization to `transformer_blocks` and
-        # excludes the first/last N blocks. It must run before calibration so that
-        # SVDQuant does not mutate the weights of the excluded blocks. The recipe
-        # is format-agnostic (applies to FP8/NVFP4/SVDQuant alike).
+        # excludes the first/last N blocks and selected modules within the middle
+        # blocks. It must run before calibration so that SVDQuant does not mutate
+        # excluded weights. The recipe is format-agnostic (applies to
+        # FP8/NVFP4/SVDQuant alike).
         block_range = MODEL_DEFAULTS.get(self.model_config.model_type, {}).get("block_range")
         if block_range is not None:
             recipe_rules = build_block_range_quant_cfg(
@@ -180,13 +181,15 @@ class Quantizer:
                 exclude_first_n=block_range.get("exclude_first_n", 2),
                 exclude_last_n=block_range.get("exclude_last_n", 2),
                 block_module=block_range.get("block_module", "transformer_blocks"),
+                full_precision_modules=block_range.get("full_precision_modules", ()),
             )
             self.logger.info(
                 f"Applying block-range recipe ({len(recipe_rules)} rules) for "
                 f"{self.model_config.model_type.value}: quantize only "
                 f"'{block_range.get('block_module', 'transformer_blocks')}' excluding "
                 f"first {block_range.get('exclude_first_n', 2)} / last "
-                f"{block_range.get('exclude_last_n', 2)} blocks."
+                f"{block_range.get('exclude_last_n', 2)} blocks; keep modules "
+                f"{block_range.get('full_precision_modules', ())} in original precision."
             )
             quant_cfg_list.extend(recipe_rules)
 
@@ -211,6 +214,7 @@ class Quantizer:
             self.config.algo.value,
             alpha=self.config.alpha,
             lowrank=self.config.lowrank,
+            magnitude_gate=self.config.magnitude_gate,
             skip_layers=svdquant_skip_layers,
         )
         self.logger.info(f"Quant config {quant_config}")
@@ -574,6 +578,11 @@ def create_argument_parser() -> argparse.ArgumentParser:
     quant_group.add_argument("--alpha", type=float, default=1.0, help="SmoothQuant alpha parameter")
     quant_group.add_argument("--lowrank", type=int, default=32, help="SVDQuant lowrank parameter")
     quant_group.add_argument(
+        "--svdquant-magnitude-gate",
+        action="store_true",
+        help="Add a zero-initialized trainable output-channel magnitude gate to SVDQuant",
+    )
+    quant_group.add_argument(
         "--quantize-mha", action="store_true", help="Quantizing MHA into FP8 if its True"
     )
     quant_group.add_argument(
@@ -681,6 +690,7 @@ def main() -> None:
             collect_method=CollectMethod(args.collect_method),
             alpha=args.alpha,
             lowrank=args.lowrank,
+            magnitude_gate=args.svdquant_magnitude_gate,
             quantize_mha=args.quantize_mha,
             compress=args.compress,
             block_size=args.block_size,

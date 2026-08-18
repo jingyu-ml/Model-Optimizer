@@ -55,6 +55,29 @@ dmd2:
   pipeline_plugin: qwen_image
   qwen_image_guidance:
 
+  # Optional student-only NVFP4-Q/K + corrected FA4-style FP8-P/V attention.
+  # The launcher supplies recipe_path from the canonical Attention Grill checkout
+  # when enabled; process-local backend state is re-applied after every restore.
+  attention_grill:
+    enabled: false
+    recipe_path:
+    ignore:
+      - transformer_blocks.0.*
+      - transformer_blocks.1.*
+      - transformer_blocks.58.*
+      - transformer_blocks.59.*
+    expected_replaced: 56
+    expected_ignored: 4
+    # The canonical corrected FP8-P/V backend checks synchronously in its
+    # trainable wrapper and has no process-level deferred-check API.
+    finite_check_policy: sync
+    preflight: true
+    # Cover Triton's aligned and unaligned integer-specialization classes for
+    # 4096 image tokens plus trimmed text embeddings.
+    preflight_sequence_lengths: [4224, 4205]
+    preflight_num_heads: 24
+    preflight_head_dim: 128
+
   # ── DMD2 method core ──
   pred_type: flow                  # Qwen-Image is rectified flow
   num_train_timesteps:             # continuous t ∈ [0, 1]; QwenImageDMDPipeline forwards t verbatim

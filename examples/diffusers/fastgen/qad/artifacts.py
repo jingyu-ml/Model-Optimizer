@@ -21,7 +21,7 @@ construction. QAD only needs two narrowly-scoped hooks around that builder:
 * validate the ModelOpt topology restored by a native Diffusers training bundle
   before FSDP;
 * after FSDP, optionally freeze everything except ModelOpt SVDQuant's HF PEFT A/B
-  parameters and rebuild AdamW from the live sharded parameters.
+  and optional magnitude parameters, then retarget AdamW to the live sharded parameters.
 
 Quantization itself is never calibrated here. The complete topology, weights,
 and quantizer buffers must already be present in the student bundle.
@@ -33,21 +33,30 @@ import contextlib
 import dataclasses
 import inspect
 import logging
+import math
+import os
 import re
+from itertools import pairwise
 from typing import TYPE_CHECKING, Any
+
+import torch
 
 import modelopt.torch.opt as mto
 from modelopt.torch.quantization.nn import TensorQuantizer
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Iterator, Mapping
 
-    import torch
     from torch import nn
 
-_SVDQUANT_PARAMETER_RE = re.compile(r"(?:^|\.)lora_[AB]\.modelopt_svdquant\.weight$")
+_SVDQUANT_PARAMETER_RE = re.compile(
+    r"(?:^|\.)(?:lora_[AB]\.modelopt_svdquant\.weight|svdquant_magnitude_delta)$"
+)
 _SUPPORTED_STUDENT_MODES = frozenset({"nvfp4", "nvfp4_svdquant"})
 _SUPPORTED_TRAIN_SCOPES = frozenset({"all", "lora_only"})
+_QWEN_IMAGE_FLASH_TIMESTEPS = (1000.0, 900.0, 750.0, 500.0)
+_QWEN_IMAGE_FLASH_SIGMAS = (1.0, 0.9, 0.75, 0.5, 0.0)
+_SUPPORTED_ATTENTION_GRILL_PROFILES = frozenset({"qwen_image", "qwen_image_flash"})
 
 
 @dataclasses.dataclass(frozen=True)
@@ -75,6 +84,50 @@ class StudentSettings:
             raise ValueError("Regular NVFP4 supports only qad.student.train_scope=all.")
 
 
+@dataclasses.dataclass(frozen=True)
+class AttentionGrillSettings:
+    """Resolved optional calibrated-attention configuration for the student."""
+
+    enabled: bool = False
+    recipe_path: str | None = None
+    calibration_path: str | None = None
+    ignore: tuple[str, ...] = ()
+    expected_replaced: int = 0
+    expected_ignored: int = 0
+    inference_profile: str | None = None
+
+    def validate(self) -> None:
+        if not self.enabled:
+            return
+        if not self.recipe_path:
+            raise ValueError(
+                "qad.attention_grill.recipe_path is required when calibrated attention is enabled."
+            )
+        if not self.calibration_path:
+            raise ValueError(
+                "qad.attention_grill.calibration_path is required when calibrated attention is enabled."
+            )
+        if not os.path.isfile(self.recipe_path):
+            raise ValueError(f"Attention Grill recipe not found: {self.recipe_path}")
+        if not os.path.isdir(self.calibration_path):
+            raise ValueError(
+                f"Attention Grill calibration directory not found: {self.calibration_path}"
+            )
+        if not self.ignore:
+            raise ValueError(
+                "qad.attention_grill.ignore must explicitly identify the uncalibrated attention blocks."
+            )
+        if self.expected_replaced <= 0 or self.expected_ignored <= 0:
+            raise ValueError(
+                "qad.attention_grill expected_replaced and expected_ignored must be positive."
+            )
+        if self.inference_profile not in _SUPPORTED_ATTENTION_GRILL_PROFILES:
+            raise ValueError(
+                "Calibrated Attention Grill requires qad.timestep.schedule=qwen_image "
+                "or qwen_image_flash."
+            )
+
+
 @dataclasses.dataclass
 class StudentBuildState:
     """Information captured while AutoModel builds the student."""
@@ -83,6 +136,7 @@ class StudentBuildState:
     quantizer_count: int = 0
     quantized_block_indices: tuple[int, ...] = ()
     svdquant_parameter_names: tuple[str, ...] = ()
+    attention_grill_summary: dict[str, Any] | None = None
 
 
 def _is_block16_nvfp4(quantizer: TensorQuantizer) -> bool:
@@ -188,6 +242,233 @@ def _find_quantized_transformer_blocks(model: nn.Module) -> tuple[int, ...]:
     return indices
 
 
+def _load_supported_static_anchor_recipe(
+    attention_grill: Any,
+    recipe_source: str | os.PathLike[str] | Mapping[str, Any],
+) -> dict[str, Any]:
+    """Load any registered Attention Grill recipe that consumes static anchors."""
+    recipe = attention_grill.load_recipe(recipe_source)
+    kernel = recipe.get("kernel")
+    if kernel not in attention_grill.available_types():
+        raise ValueError(f"Attention Grill kernel {kernel!r} is not registered in this checkout.")
+    if (recipe.get("smooth") or {}).get("mode") != "static_anchor":
+        raise ValueError(
+            "This path requires an Attention Grill recipe whose normalized "
+            "smooth.mode is 'static_anchor'."
+        )
+    return recipe
+
+
+def _validate_attention_grill_manifest(
+    manifest: Mapping[str, Any],
+    settings: AttentionGrillSettings,
+    student: StudentSettings,
+) -> dict[str, Any]:
+    manifest = dict(manifest)
+
+    artifact_mode = str(manifest.get("student_mode", "")).lower()
+    if artifact_mode != student.mode:
+        raise RuntimeError(
+            "Attention Grill calibration/student mode mismatch: artifact has "
+            f"{artifact_mode!r}, QAD requested {student.mode!r}."
+        )
+
+    artifact_student = manifest.get("student_model")
+    if not artifact_student:
+        raise RuntimeError(
+            "Attention Grill calibration manifest does not record its student_model."
+        )
+    if os.path.realpath(str(artifact_student)) != os.path.realpath(student.model_name_or_path):
+        raise RuntimeError(
+            "Attention Grill calibration was produced for a different student bundle: "
+            f"artifact={artifact_student!r}, QAD={student.model_name_or_path!r}."
+        )
+
+    inference = manifest.get("inference") or {}
+    artifact_profile = inference.get("profile")
+    # Calib64 artifacts created before regular Qwen-Image support predate the
+    # explicit profile field and are all exact Flash four-step artifacts.
+    if artifact_profile is None and int(inference.get("num_inference_steps", 0)) == len(
+        _QWEN_IMAGE_FLASH_TIMESTEPS
+    ):
+        artifact_profile = "qwen_image_flash"
+    if artifact_profile != settings.inference_profile:
+        raise RuntimeError(
+            "Attention Grill calibration/inference profile mismatch: artifact has "
+            f"{artifact_profile!r}, QAD requested {settings.inference_profile!r}."
+        )
+
+    timesteps = tuple(float(value) for value in inference.get("timesteps", ()))
+    sigmas = tuple(float(value) for value in inference.get("sigmas", ()))
+    if artifact_profile == "qwen_image_flash":
+        if (
+            int(inference.get("num_inference_steps", 0)) != len(_QWEN_IMAGE_FLASH_TIMESTEPS)
+            or timesteps != _QWEN_IMAGE_FLASH_TIMESTEPS
+            or float(inference.get("true_cfg_scale", 0.0)) != 1.0
+            or len(sigmas) != len(_QWEN_IMAGE_FLASH_SIGMAS)
+            or any(
+                abs(actual - expected) > 1e-6
+                for actual, expected in zip(sigmas, _QWEN_IMAGE_FLASH_SIGMAS)
+            )
+        ):
+            raise RuntimeError(
+                "Qwen-Image-Flash Attention Grill calibration must use no-CFG and the "
+                f"exact timesteps {_QWEN_IMAGE_FLASH_TIMESTEPS}; manifest has {timesteps}."
+            )
+    else:
+        regular_contract_valid = (
+            int(inference.get("num_inference_steps", 0)) == 50
+            and float(inference.get("true_cfg_scale", 0.0)) == 4.0
+            and bool(inference.get("negative_prompt_provided", False))
+            and inference.get("negative_prompt") == " "
+            and int(inference.get("calls_per_prompt", 0)) == 100
+            and int(inference.get("height", 0)) == 1024
+            and int(inference.get("width", 0)) == 1024
+            and len(timesteps) == 50
+            and len(sigmas) == 51
+            and all(math.isfinite(value) for value in (*timesteps, *sigmas))
+            and all(left > right for left, right in pairwise(timesteps))
+            and all(left > right for left, right in pairwise(sigmas))
+            and abs(sigmas[-1]) <= 1e-7
+            and all(
+                abs(timestep - sigma * 1000.0) <= 1e-3 for timestep, sigma in zip(timesteps, sigmas)
+            )
+        )
+        if not regular_contract_valid:
+            raise RuntimeError(
+                "Regular Qwen-Image Attention Grill calibration must record the native "
+                "1024x1024 50-step true-CFG inference trajectory."
+            )
+
+    modules = manifest.get("modules")
+    if not isinstance(modules, dict) or not modules:
+        raise RuntimeError("Attention Grill calibration manifest has no module mapping.")
+    return manifest
+
+
+def _install_attention_grill(
+    model: nn.Module,
+    *,
+    student: StudentSettings,
+    settings: AttentionGrillSettings,
+) -> dict[str, Any] | None:
+    """Install one validated static-attention artifact before FSDP mutates the tree."""
+    if not settings.enabled:
+        return None
+
+    try:
+        import attention_grill
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise RuntimeError(
+            "qad.attention_grill.enabled=true requires the optional attention-grill "
+            "package. Install it or add its source directory to PYTHONPATH."
+        ) from exc
+
+    recipe = _load_supported_static_anchor_recipe(attention_grill, settings.recipe_path)
+    artifact = attention_grill.load_calibration(settings.calibration_path)
+    manifest = _validate_attention_grill_manifest(artifact.manifest, settings, student)
+    calibrated_modules = artifact.module_names
+    if len(calibrated_modules) != settings.expected_replaced:
+        raise RuntimeError(
+            "Attention Grill calibration module count does not match "
+            f"qad.attention_grill.expected_replaced={settings.expected_replaced}: "
+            f"found {len(calibrated_modules)}."
+        )
+
+    parameters_before = tuple(
+        (name, id(parameter), parameter.requires_grad)
+        for name, parameter in model.named_parameters()
+    )
+    report = attention_grill.replace(
+        model,
+        recipe=recipe,
+        calibration=artifact.root,
+        ignore=settings.ignore,
+    )
+    if report.recipe != recipe:
+        raise RuntimeError(
+            "Attention Grill replacement did not report the normalized recipe selected by QAD."
+        )
+    calibration = report.calibration
+    if calibration is None:
+        raise RuntimeError("Attention Grill replacement did not consume calibration anchors.")
+    if calibration.get("anchors_sha256") != artifact.anchors_sha256:
+        raise RuntimeError(
+            "Attention Grill replacement reported a different calibration anchor hash."
+        )
+    if os.path.realpath(str(calibration.get("directory", ""))) != os.path.realpath(artifact.root):
+        raise RuntimeError(
+            "Attention Grill replacement reported a different calibration directory."
+        )
+    if len(report.replaced) != settings.expected_replaced:
+        raise RuntimeError(
+            f"Attention Grill replaced {len(report.replaced)} modules; expected "
+            f"{settings.expected_replaced}."
+        )
+    if len(report.ignored) != settings.expected_ignored:
+        raise RuntimeError(
+            f"Attention Grill ignored {len(report.ignored)} modules; expected "
+            f"{settings.expected_ignored}."
+        )
+    if set(report.replaced) != set(calibrated_modules):
+        missing = sorted(set(calibrated_modules) - set(report.replaced))
+        extra = sorted(set(report.replaced) - set(calibrated_modules))
+        raise RuntimeError(
+            "Attention Grill replacement does not exactly match the calibrated modules "
+            f"(missing={missing[:5]}, extra={extra[:5]})."
+        )
+
+    parameters_after = tuple(
+        (name, id(parameter), parameter.requires_grad)
+        for name, parameter in model.named_parameters()
+    )
+    if parameters_after != parameters_before:
+        raise RuntimeError(
+            "Installing Attention Grill unexpectedly changed student parameter identity "
+            "or trainability before FSDP."
+        )
+
+    anchor_backends = tuple(
+        (name, module)
+        for name, module in model.named_modules()
+        if name.endswith("._grill_static_smooth_qk_backend")
+    )
+    if len(anchor_backends) != settings.expected_replaced:
+        raise RuntimeError(
+            "Attention Grill did not bind one static anchor module per replaced attention: "
+            f"found {len(anchor_backends)}, expected {settings.expected_replaced}."
+        )
+    for name, module in anchor_backends:
+        for buffer_name in ("q_anchor", "k_anchor"):
+            if buffer_name not in module._buffers:
+                raise RuntimeError(f"{name} is missing frozen {buffer_name} buffer.")
+            if buffer_name not in module._non_persistent_buffers_set:
+                raise RuntimeError(
+                    f"{name}.{buffer_name} must stay non-persistent and be restored "
+                    "from the calibrated artifact on every QAD startup."
+                )
+
+    summary = {
+        "kernel": report.type,
+        "recipe_path": settings.recipe_path,
+        "calibration_path": calibration.get("directory", settings.calibration_path),
+        "anchors_sha256": calibration.get("anchors_sha256"),
+        "replaced": tuple(report.replaced),
+        "ignored": tuple(report.ignored),
+        "prompt_count": int((manifest.get("prompt_source") or {}).get("count", 0)),
+    }
+    logging.info(
+        "[QAD] installed calibrated Attention Grill before FSDP: kernel=%s "
+        "replaced=%d ignored=%d prompts=%d anchors=%s",
+        summary["kernel"],
+        len(summary["replaced"]),
+        len(summary["ignored"]),
+        summary["prompt_count"],
+        str(summary["anchors_sha256"])[:12],
+    )
+    return summary
+
+
 def _modelopt_mode_states(model: nn.Module) -> dict[str, dict[str, Any]]:
     if not mto.ModeloptStateManager.is_converted(model):
         return {}
@@ -243,21 +524,41 @@ def _validate_svdquant_bundle(model: nn.Module) -> tuple[str, ...]:
         )
 
     expected_targets = tuple(metadata.get("target_modules", ()))
-    names = tuple(
-        name for name, _ in model.named_parameters() if _SVDQUANT_PARAMETER_RE.search(name)
-    )
+    named_parameters = dict(model.named_parameters())
+    names = tuple(name for name in named_parameters if _SVDQUANT_PARAMETER_RE.search(name))
     expected_names = {
         f"{target_name}.lora_{factor}.modelopt_svdquant.weight"
         for target_name in expected_targets
         for factor in ("A", "B")
     }
+    magnitude_gate_version = int(metadata.get("magnitude_gate_version", 0))
+    if magnitude_gate_version not in (0, 1):
+        raise RuntimeError(f"Unsupported SVDQuant magnitude gate version: {magnitude_gate_version}")
+    if magnitude_gate_version:
+        expected_names.update(
+            f"{target_name}.svdquant_magnitude_delta" for target_name in expected_targets
+        )
     if not expected_targets or set(names) != expected_names:
         raise RuntimeError(
-            "The SVDQuant bundle did not restore a complete pair of "
-            "lora_A/lora_B.modelopt_svdquant weights for every target module. "
+            "The SVDQuant bundle did not restore the complete versioned set of "
+            "lora_A/lora_B/magnitude parameters for every target module. "
             "A weight-free quantizer state or a deployment export is not a valid "
             "QAD training bundle."
         )
+    if magnitude_gate_version:
+        invalid_magnitude_shapes = []
+        for target_name in expected_targets:
+            target = model.get_submodule(target_name)
+            get_base_layer = getattr(target, "get_base_layer", None)
+            base_layer = get_base_layer() if callable(get_base_layer) else target
+            parameter = named_parameters[f"{target_name}.svdquant_magnitude_delta"]
+            if tuple(parameter.shape) != (base_layer.out_features,):
+                invalid_magnitude_shapes.append(target_name)
+        if invalid_magnitude_shapes:
+            raise RuntimeError(
+                "SVDQuant magnitude deltas must have one value per output channel: "
+                + ", ".join(invalid_magnitude_shapes[:5])
+            )
     _validate_nvfp4_quantizers(
         model,
         artifact_name="The SVDQuant student bundle",
@@ -283,7 +584,7 @@ def _validate_svdquant_bundle(model: nn.Module) -> tuple[str, ...]:
             + ", ".join(missing_pre_quant_scale_buffers[:5])
         )
     logging.info(
-        "[QAD] validated SVDQuant training bundle before FSDP: %d targets, %d A/B tensors",
+        "[QAD] validated SVDQuant training bundle before FSDP: %d targets, %d trainable tensors",
         len(expected_targets),
         len(names),
     )
@@ -324,14 +625,19 @@ def _rebuild_optimizer_from_live_parameters(
     optimizer: torch.optim.Optimizer,
     parameters: list[nn.Parameter],
 ) -> torch.optim.Optimizer:
-    """Recreate the just-built optimizer without carrying stale parameter refs."""
+    """Retarget the just-built optimizer without carrying stale parameter refs."""
     if optimizer.state:
         raise RuntimeError("QAD expected a newly-created optimizer with no state.")
     if len(optimizer.param_groups) != 1:
         raise RuntimeError(
             "QAD lora_only currently expects AutoModel to create one optimizer parameter group."
         )
-    return type(optimizer)(parameters, **dict(optimizer.defaults))
+    # Optimizer.defaults may contain normalized/internal fields that its public
+    # constructor does not accept (for example AdamW's
+    # ``decoupled_weight_decay``). Preserve the fresh optimizer and its exact
+    # configured group hyperparameters, replacing only the owned parameters.
+    optimizer.param_groups[0]["params"] = list(parameters)
+    return optimizer
 
 
 def _validate_optimizer_membership(
@@ -347,6 +653,68 @@ def _validate_optimizer_membership(
         raise RuntimeError(
             "Student optimizer membership does not exactly match the live post-FSDP "
             f"trainable parameters (missing={len(expected - actual)}, extra={len(actual - expected)})."
+        )
+
+
+def _validate_attention_grill_after_fsdp(
+    model: nn.Module,
+    settings: AttentionGrillSettings,
+) -> None:
+    if not settings.enabled:
+        return
+
+    anchor_backends = tuple(
+        (name, module)
+        for name, module in model.named_modules()
+        if name.endswith("._grill_static_smooth_qk_backend")
+    )
+    if len(anchor_backends) != settings.expected_replaced:
+        raise RuntimeError(
+            "FSDP/activation checkpointing did not preserve the calibrated Attention "
+            f"Grill modules: found {len(anchor_backends)}, expected {settings.expected_replaced}."
+        )
+    for name, module in anchor_backends:
+        for buffer_name in ("q_anchor", "k_anchor"):
+            buffer = module._buffers.get(buffer_name)
+            if buffer is None:
+                raise RuntimeError(f"Post-FSDP {name} is missing {buffer_name}.")
+            if buffer.requires_grad:
+                raise RuntimeError(f"Attention Grill anchor {name}.{buffer_name} became trainable.")
+            if buffer.device.type != "cuda" or buffer.dtype != torch.bfloat16:
+                raise RuntimeError(
+                    f"Attention Grill anchor {name}.{buffer_name} must remain local CUDA BF16, "
+                    f"got device={buffer.device} dtype={buffer.dtype}."
+                )
+            if buffer_name not in module._non_persistent_buffers_set:
+                raise RuntimeError(
+                    f"Attention Grill anchor {name}.{buffer_name} became checkpoint-persistent."
+                )
+
+    anchor_parameters = [
+        name for name, _ in model.named_parameters() if "_grill_static_smooth_qk_backend" in name
+    ]
+    if anchor_parameters:
+        raise RuntimeError(
+            "Attention Grill must not add optimizer-owned parameters: "
+            + ", ".join(anchor_parameters[:5])
+        )
+
+    bound_count = 0
+    for module in model.modules():
+        processor = getattr(module, "processor", None)
+        if processor is None or not hasattr(processor, "_grill_bound_backend_handle"):
+            continue
+        handle = processor._grill_bound_backend_handle
+        if processor._attention_backend != handle.member:
+            raise RuntimeError(
+                "The calibrated Attention Grill backend was overwritten after FSDP. "
+                "Do not set model.attention_backend for this QAD run."
+            )
+        bound_count += 1
+    if bound_count != settings.expected_replaced:
+        raise RuntimeError(
+            f"Post-FSDP Attention Grill has {bound_count} bound processors; expected "
+            f"{settings.expected_replaced}."
         )
 
 
@@ -374,6 +742,7 @@ def _guard_automodel_hooks(diffusion_train: Any, auto_pipeline: Any) -> None:
 @contextlib.contextmanager
 def patch_student_build(
     settings: StudentSettings,
+    attention_grill: AttentionGrillSettings | None = None,
 ) -> Iterator[StudentBuildState]:
     """Patch the two example-local seams needed during the parent ``setup`` call.
 
@@ -387,6 +756,8 @@ def patch_student_build(
     original_apply_parallelization = auto_pipeline._apply_parallelization
     original_build_model_and_optimizer = diffusion_train.build_model_and_optimizer
     state = StudentBuildState()
+    attention_grill = attention_grill or AttentionGrillSettings()
+    attention_grill.validate()
     apply_calls = 0
 
     def apply_parallelization(pipe, parallel_scheme):
@@ -406,15 +777,21 @@ def patch_student_build(
                 isinstance(module, TensorQuantizer) for module in transformer.modules()
             )
         state.quantized_block_indices = _find_quantized_transformer_blocks(transformer)
+        state.attention_grill_summary = _install_attention_grill(
+            transformer,
+            student=settings,
+            settings=attention_grill,
+        )
         return original_apply_parallelization(pipe, parallel_scheme)
 
     def build_model_and_optimizer(**kwargs):
         pipe, optimizer, device_mesh = original_build_model_and_optimizer(**kwargs)
+        _validate_attention_grill_after_fsdp(pipe.transformer, attention_grill)
         trainable = _apply_train_scope(pipe.transformer, settings.train_scope)
         if settings.train_scope == "lora_only":
             optimizer = _rebuild_optimizer_from_live_parameters(optimizer, trainable)
             logging.info(
-                "[QAD] rebuilt optimizer after FSDP for lora_only: %d live A/B tensors",
+                "[QAD] rebuilt optimizer after FSDP for lora_only: %d live SVDQuant tensors",
                 len(trainable),
             )
         _validate_optimizer_membership(pipe.transformer, optimizer)

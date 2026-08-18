@@ -26,13 +26,40 @@ teacher is selected.
   four-step construction. It uniformly samples only model timesteps
   `[1000, 900, 750, 500]`, corresponding to shifted sigmas
   `[1.0, 0.9, 0.75, 0.5]`. The terminal sigma `0.0` is validated but never
-  sampled because the transformer is not evaluated there. A dynamic-shift
-  original Qwen-Image scheduler is rejected in this mode.
+  sampled because the transformer is not evaluated there. A half-open
+  `[inference_step_start, inference_step_end)` range can select a strict subset
+  of these discrete calls: `[0,1)` selects only `t=1000`, while `[1,4)` samples
+  only `t=[900,750,500]`. A dynamic-shift original Qwen-Image scheduler is
+  rejected in this mode.
 - `qwen_image` preserves full-range flow-matching sampling for an original
   Qwen-Image student. Set `flow_matching.timestep_sampling` to `logit_normal` or
   `uniform`. Both use AutoModel's configured flow shift; set
   `flow_matching.use_sigma_noise=false` for uniform sampling directly in sigma
   space. A static shift-3 Flash scheduler is rejected in this mode.
+
+  It can also uniformly sample a continuous slice of the model's official
+  inference trajectory. Configure the half-open denoising-step range
+  `[inference_step_start, inference_step_end)`, the inference step count, and
+  the packed image sequence length. The recipe reads the dynamic-shift settings
+  from the student bundle and converts those step boundaries to model sigma and
+  timestep bounds; it does not clamp samples from a full-range distribution.
+  This range mode requires `flow_matching.timestep_sampling=uniform`.
+
+  For 1024x1024 Qwen-Image, `image_seq_len=4096`. With 50 inference steps,
+  `[0, 5)` resolves to approximately `t=[946.335, 1000]`, and `[5, 50)` to
+  `t=[0, 946.335]` on the `[0, 1000]` training scale:
+
+  ```yaml
+  qad:
+    timestep:
+      schedule: qwen_image
+      num_inference_steps: 50
+      inference_step_start: 0
+      inference_step_end: 5
+      image_seq_len: 4096
+  flow_matching:
+    timestep_sampling: uniform
+  ```
 
 The Flash path intentionally mirrors QwenImagePipeline's raw-sigma construction;
 calling `scheduler.set_timesteps(4)` directly produces a different schedule.
@@ -68,8 +95,9 @@ training bundle. The bundle must contain the complete SVDQuant student:
 - a DiffusionPipeline root with `model_index.json` (not only a standalone
   transformer `save_pretrained` directory);
 - the ModelOpt topology and quantizer state;
-- the residual weights produced by SVDQuant calibration; and
-- the Hugging Face PEFT A/B factors for the SVDQuant low-rank branch.
+- the residual weights produced by SVDQuant calibration;
+- the Hugging Face PEFT A/B factors for the SVDQuant low-rank branch; and
+- for magnitude-enabled bundles, the zero-initialized per-output-channel magnitude delta.
 
 For the standard Diffusers layout, the transformer files and ModelOpt sidecar
 are under `transformer/`, including `transformer/modelopt_state.pth`. The path
@@ -84,15 +112,60 @@ must not be used here.
 The SVDQuant topology is restored before FSDP and before optimizer construction.
 `qad.student.train_scope=all` is the default and trains both the residual/base
 parameters and the PEFT factors. Set it to `lora_only` to freeze every student
-parameter except the SVDQuant PEFT A/B factors. In both scopes,
-`pre_quant_scale` remains ModelOpt buffer state and is never placed in the
-optimizer.
+parameter except the SVDQuant PEFT A/B factors and, when present, its magnitude
+delta. In both scopes, `pre_quant_scale` remains ModelOpt buffer state and is
+never placed in the optimizer.
 
 Use [`configs/qwen_image_svdquant_nvfp4.yaml`](configs/qwen_image_svdquant_nvfp4.yaml)
 as the starting configuration.
 
 QAD is restore-only in both modes. It does not calibrate a student during
 distributed training.
+
+## Assemble inference bundles
+
+Each training checkpoint keeps FSDP/DCP shards for resume and writes an
+inference-ready transformer under `model/consolidated/`. The consolidated
+directory is not a complete pipeline and does not contain
+`modelopt_state.pth`. Assemble every complete checkpoint with the exact pre-QAD
+student bundle recorded in its `config.yaml`:
+
+```bash
+python examples/diffusers/fastgen/qad/inference_bundle.py \
+  /path/to/qad_run
+```
+
+This creates `/path/to/qad_run/inference/epoch_N_step_M`. The default
+`--materialize symlink` mode links the static pipeline components, the original
+student's `transformer/modelopt_state.pth`, and the checkpoint's consolidated
+weights/index/config instead of duplicating them. Use `--materialize copy` only
+when a physically independent bundle is required. Re-running the command skips
+already assembled bundles and adds newly completed checkpoints.
+
+To update every run immediately below one training output root, use:
+
+```bash
+bash examples/diffusers/fastgen/qad/assemble_all_inference_bundles.sh \
+  /path/to/qad_training/output
+```
+
+Every output contains `qad_bundle.json`. GEMM-only experiments record
+`attention_quantization.provider=none`. Experiments trained with quantized
+attention record the exact Attention Grill recipe, calibration artifact, ignore
+scope, and expected replacement counts. Use the QAD loader so this distinction
+is honored automatically:
+
+```python
+from qad.inference_bundle import load_qad_pipeline
+
+pipe = load_qad_pipeline("/path/to/qad_run/inference/epoch_0_step_1499")
+```
+
+The loader first restores the ModelOpt GEMM/SVDQuant topology and QAD weights.
+For an Attention Grill bundle it then installs the recorded calibrated attention
+replacement. A plain `QwenImagePipeline.from_pretrained()` call restores only
+the ModelOpt portion and is therefore not the complete inference path for those
+experiments.
 
 ## Prepare a student bundle
 
@@ -268,7 +341,8 @@ The launcher must invoke `examples/diffusers/fastgen/qad/finetune.py`.
 Pointing the existing DMD2 launcher at a QAD YAML is not sufficient when that
 launcher still hard-codes `dmd2_finetune.py`.
 
-The launch environment contains no Attention Grill settings. It also contains
+Attention Grill is optional and is enabled only when QAD is given an external
+recipe and its matching calibrated artifact. The launch environment contains
 no DMD2 timestep, fake-score, discriminator, negative-prompt, GAN, or EMA
 settings. QAD currently requires `fsdp.tp_size=1`, `fsdp.cp_size=1`, and
 `fsdp.pp_size=1`; data parallelism is controlled through `fsdp.dp_size`.

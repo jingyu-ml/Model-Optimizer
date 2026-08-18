@@ -16,6 +16,7 @@ from ..nn import SVDQuantLinear
 __all__ = []
 
 _SVDQUANT_ADAPTER_NAME = "modelopt_svdquant"
+_SVDQUANT_MAGNITUDE_GATE_VERSION = 1
 
 
 class _SVDQuantPeftLinear(LoraLinear):
@@ -26,7 +27,19 @@ class _SVDQuantPeftLinear(LoraLinear):
         base_layer = self.get_base_layer()
         scaled_x = base_layer._apply_pre_quant_scale(x)
         with base_layer.input_quantizer.disable_pre_quant_scale():
-            return super().forward(scaled_x, *args, **kwargs)
+            output = super().forward(scaled_x, *args, **kwargs)
+
+        magnitude_delta = getattr(self, "svdquant_magnitude_delta", None)
+        if (
+            magnitude_delta is None
+            or self.disable_adapters
+            or _SVDQUANT_ADAPTER_NAME not in self.active_adapters
+        ):
+            return output
+
+        bias = getattr(base_layer, "bias", None)
+        weight_output = output if bias is None else output - bias
+        return output + weight_output * magnitude_delta.to(dtype=output.dtype)
 
 
 def _svdquant_peft_config(target_names: list[str], rank: int) -> LoraConfig:
@@ -67,7 +80,10 @@ def _inject_svdquant_peft(
     target_names: list[str],
     rank: int,
     factors: dict[str, tuple[torch.Tensor, torch.Tensor]] | None,
+    magnitude_gate_version: int = 0,
 ) -> dict[str, Any]:
+    if magnitude_gate_version not in (0, _SVDQUANT_MAGNITUDE_GATE_VERSION):
+        raise ValueError(f"Unsupported SVDQuant magnitude gate version: {magnitude_gate_version}")
     target_names = sorted(target_names)
     base_trainability = [(parameter, parameter.requires_grad) for parameter in model.parameters()]
     config = _svdquant_peft_config(target_names, rank)
@@ -90,16 +106,29 @@ def _inject_svdquant_peft(
                 lora_a.copy_(source_a.to(device=lora_a.device, dtype=lora_a.dtype))
                 lora_b.copy_(source_b.to(device=lora_b.device, dtype=lora_b.dtype))
             _delete_quantizer_svdquant_factors(module.get_base_layer().weight_quantizer)
+        if magnitude_gate_version:
+            module.register_parameter(
+                "svdquant_magnitude_delta",
+                nn.Parameter(lora_b.new_zeros(lora_b.shape[0])),
+            )
         lora_a.requires_grad_(True)
         lora_b.requires_grad_(True)
 
-    return {
+    metadata = {
         "rank": rank,
         "target_modules": target_names,
     }
+    if magnitude_gate_version:
+        metadata["magnitude_gate_version"] = magnitude_gate_version
+    return metadata
 
 
-def _externalize_svdquant_lora(model: nn.Module, rank: int) -> dict[str, Any] | None:
+def _externalize_svdquant_lora(
+    model: nn.Module,
+    rank: int,
+    *,
+    magnitude_gate: bool = False,
+) -> dict[str, Any] | None:
     """Move calibrated SVDQuant factors from weight quantizers into HF PEFT."""
     factors = {}
     for name, module in model.named_modules():
@@ -111,7 +140,13 @@ def _externalize_svdquant_lora(model: nn.Module, rank: int) -> dict[str, Any] | 
             factors[name] = (lora_a.detach(), lora_b.detach())
     if not factors:
         return None
-    return _inject_svdquant_peft(model, list(factors), rank, factors)
+    return _inject_svdquant_peft(
+        model,
+        list(factors),
+        rank,
+        factors,
+        magnitude_gate_version=_SVDQUANT_MAGNITUDE_GATE_VERSION if magnitude_gate else 0,
+    )
 
 
 def _restore_svdquant_peft(model: nn.Module, metadata: dict[str, Any]) -> None:
@@ -121,4 +156,5 @@ def _restore_svdquant_peft(model: nn.Module, metadata: dict[str, Any]) -> None:
         metadata["target_modules"],
         metadata["rank"],
         factors=None,
+        magnitude_gate_version=metadata.get("magnitude_gate_version", 0),
     )

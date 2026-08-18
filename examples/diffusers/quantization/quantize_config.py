@@ -77,6 +77,7 @@ class QuantizationConfig:
     collect_method: CollectMethod = CollectMethod.DEFAULT
     alpha: float = 1.0  # SmoothQuant alpha
     lowrank: int = 32  # SVDQuant lowrank
+    magnitude_gate: bool = False  # SVDQuant output-channel magnitude gate
     quantize_mha: bool = False
     compress: bool = False
     block_size: int = 16  # NVFP4 block size
@@ -89,6 +90,8 @@ class QuantizationConfig:
             raise ValueError("MHA quantization is only supported for FP8, not INT8.")
         if self.compress and self.format == QuantFormat.INT8:
             raise ValueError("Compression is only supported for FP8 and FP4, not INT8.")
+        if self.magnitude_gate and self.algo != QuantAlgo.SVDQUANT:
+            raise ValueError("The magnitude gate is supported only with SVDQuant.")
 
 
 @dataclass

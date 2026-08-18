@@ -558,7 +558,11 @@ class SVDQuantModeDescriptor(BaseCalibrateModeDescriptor):
                 supports_layerwise=self.__class__._supports_layerwise,
             )
 
-            peft_metadata = _externalize_svdquant_lora(model, rank)
+            peft_metadata = _externalize_svdquant_lora(
+                model,
+                rank,
+                magnitude_gate=config.magnitude_gate,
+            )
             metadata = {}
             update_quantize_metadata(model, config, metadata)
             if peft_metadata is not None:

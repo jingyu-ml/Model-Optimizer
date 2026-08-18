@@ -39,11 +39,13 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import importlib
 import json
 import logging
 import os
 import re
 import shutil
+from collections.abc import Mapping
 from typing import Any
 
 import torch
@@ -199,6 +201,19 @@ _PIPELINE_PLUGIN_BY_MODEL_SUBSTR = (
 
 _DMD_COMPLETE_MARKER = "dmd2_complete.marker"
 
+_ATTENTION_GRILL_DEFAULT_IGNORE = (
+    "transformer_blocks.0.*",
+    "transformer_blocks.1.*",
+    "transformer_blocks.58.*",
+    "transformer_blocks.59.*",
+)
+
+# The canonical corrected FA4-style plain-FP8-P/V backend performs a native
+# synchronous finite-input check in its trainable autograd wrapper. It does not
+# expose a process-level health-check API, so ``sync`` is its only truthful
+# integration policy.
+_ATTENTION_GRILL_NATIVE_SYNC_TYPES = frozenset({"nvfp4-q4over6-smooth-qk-fp8-pv-flash-attn"})
+
 
 @dataclasses.dataclass(frozen=True)
 class _QuantSettings:
@@ -221,6 +236,22 @@ class _QuantSettings:
     enabled: bool
     quant_state_path: str | None
     init_weights_from: str | None
+
+
+@dataclasses.dataclass(frozen=True)
+class _AttentionGrillSettings:
+    """Resolved optional Attention Grill backend settings for the student."""
+
+    enabled: bool
+    recipe_path: str | None
+    ignore: tuple[str, ...]
+    expected_replaced: int
+    expected_ignored: int
+    finite_check_policy: str
+    preflight: bool
+    preflight_sequence_lengths: tuple[int, ...]
+    preflight_num_heads: int
+    preflight_head_dim: int
 
 
 class DMD2DiffusionRecipe(TrainDiffusionRecipe):
@@ -272,6 +303,11 @@ class DMD2DiffusionRecipe(TrainDiffusionRecipe):
         #    trailing call to self.load_checkpoint(self.restore_from) runs BEFORE our
         #    extras exist, so it only restores the student — that is intentional and safe.
         super().setup()
+
+        # Install the stateless attention backend only after the student's FP weights and
+        # optional ModelOpt quantizer state have been restored. This runs on every rank and
+        # therefore also re-applies the process-local Diffusers backend on every restart.
+        self._install_attention_grill()
 
         # 2. Load the frozen teacher. Same from_pretrained path, same parallel_scheme, but
         #    ``load_for_training=False`` so the transformer comes back in eval mode with
@@ -547,6 +583,11 @@ class DMD2DiffusionRecipe(TrainDiffusionRecipe):
                         self._discriminator_optimizer.step()
                         micro_disc_losses.append(float(disc_losses["total"].item()))
 
+                # Drain deferred device-side checks before clipping or updating
+                # weights when a backend exposes that API. The canonical FP8-P/V
+                # backend checks synchronously and takes the native no-op path.
+                self._raise_attention_grill_if_nonfinite()
+
                 # Grad clip on whichever module is the active trainable.
                 if is_student_phase:
                     grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -733,6 +774,361 @@ class DMD2DiffusionRecipe(TrainDiffusionRecipe):
         )
         self.__dict__["_quant_settings"] = settings
         return settings
+
+    def _resolve_attention_grill_settings(self) -> _AttentionGrillSettings:
+        """Parse and cache the optional ``dmd2.attention_grill`` block."""
+        cached = self.__dict__.get("_attention_grill_settings")
+        if cached is not None:
+            return cached
+
+        node = self.cfg.get("dmd2.attention_grill", None)
+        d = {} if node is None else (node.to_dict() if hasattr(node, "to_dict") else dict(node))
+        enabled = bool(d.get("enabled", False))
+        recipe_path = d.get("recipe_path")
+        if recipe_path is not None:
+            recipe_path = os.fspath(recipe_path)
+
+        ignore = d.get("ignore", _ATTENTION_GRILL_DEFAULT_IGNORE)
+        if isinstance(ignore, str):
+            ignore = [ignore]
+        if not isinstance(ignore, list | tuple) or not all(isinstance(x, str) for x in ignore):
+            raise TypeError("dmd2.attention_grill.ignore must be a string or a list of strings.")
+
+        expected_replaced = d.get("expected_replaced", 56)
+        expected_ignored = d.get("expected_ignored", 4)
+        for key, value in (
+            ("expected_replaced", expected_replaced),
+            ("expected_ignored", expected_ignored),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"dmd2.attention_grill.{key} must be a non-negative integer.")
+
+        finite_check_policy = d.get("finite_check_policy", "sync")
+        if not isinstance(finite_check_policy, str) or finite_check_policy not in {
+            "off",
+            "deferred",
+            "sync",
+        }:
+            raise ValueError(
+                "dmd2.attention_grill.finite_check_policy must be one of "
+                "{'off', 'deferred', 'sync'}."
+            )
+        preflight = bool(d.get("preflight", enabled))
+        preflight_sequence_lengths = d.get("preflight_sequence_lengths", [4224, 4205])
+        if isinstance(preflight_sequence_lengths, int):
+            preflight_sequence_lengths = [preflight_sequence_lengths]
+        if (
+            not isinstance(preflight_sequence_lengths, list | tuple)
+            or not preflight_sequence_lengths
+            or any(
+                isinstance(length, bool) or not isinstance(length, int) or length <= 0
+                for length in preflight_sequence_lengths
+            )
+        ):
+            raise ValueError(
+                "dmd2.attention_grill.preflight_sequence_lengths must be a non-empty list "
+                "of positive integers."
+            )
+        preflight_num_heads = d.get("preflight_num_heads", 24)
+        preflight_head_dim = d.get("preflight_head_dim", 128)
+        for key, value in (
+            ("preflight_num_heads", preflight_num_heads),
+            ("preflight_head_dim", preflight_head_dim),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"dmd2.attention_grill.{key} must be a positive integer.")
+        if enabled and not recipe_path:
+            raise ValueError(
+                "dmd2.attention_grill.enabled is true but recipe_path is unset. Point it at "
+                "an Attention Grill quantization recipe YAML."
+            )
+
+        settings = _AttentionGrillSettings(
+            enabled=enabled,
+            recipe_path=recipe_path,
+            ignore=tuple(ignore),
+            expected_replaced=expected_replaced,
+            expected_ignored=expected_ignored,
+            finite_check_policy=finite_check_policy,
+            preflight=preflight,
+            preflight_sequence_lengths=tuple(preflight_sequence_lengths),
+            preflight_num_heads=preflight_num_heads,
+            preflight_head_dim=preflight_head_dim,
+        )
+        self.__dict__["_attention_grill_settings"] = settings
+        return settings
+
+    @staticmethod
+    def _config_flag_enabled(value: Any) -> bool:
+        """Interpret common scalar or mapping-shaped compile flags."""
+        if value is None:
+            return False
+        if hasattr(value, "to_dict"):
+            value = value.to_dict()
+        if isinstance(value, Mapping):
+            for key in ("enabled", "enable"):
+                if key in value:
+                    return bool(value[key])
+            return bool(value)
+        return bool(value)
+
+    def _attention_grill_compile_enabled(self) -> bool:
+        """Return whether a known config or runtime marker enables ``torch.compile``."""
+        for key in (
+            "compile",
+            "torch_compile",
+            "model.compile",
+            "model.torch_compile",
+            "model.compile_model",
+            "fsdp.enable_compile",
+        ):
+            if self._config_flag_enabled(self.cfg.get(key, None)):
+                return True
+        return bool(
+            getattr(self.model, "_orig_mod", None) is not None
+            or getattr(self.model, "_compiled_call_impl", None) is not None
+        )
+
+    def _install_attention_grill(self) -> None:
+        """Install the configured Attention Grill backend on the restored student only."""
+        settings = self._resolve_attention_grill_settings()
+        if not settings.enabled:
+            return
+
+        fsdp_cfg = self.cfg.get("fsdp", None) or {}
+        cp_size = fsdp_cfg.get("cp_size", 1)
+        cp_size = 1 if cp_size is None else int(cp_size)
+        if cp_size != 1:
+            raise ValueError(
+                "dmd2.attention_grill requires fsdp.cp_size=1; Attention Grill does not "
+                f"support context parallelism (got cp_size={cp_size})."
+            )
+        if self._attention_grill_compile_enabled():
+            raise ValueError(
+                "dmd2.attention_grill requires eager PyTorch training; disable torch.compile."
+            )
+        if not os.path.isfile(settings.recipe_path):
+            raise FileNotFoundError(
+                f"dmd2.attention_grill.recipe_path does not exist: {settings.recipe_path}"
+            )
+
+        try:
+            attention_grill = importlib.import_module("attention_grill")
+        except ModuleNotFoundError as exc:
+            if exc.name != "attention_grill":
+                raise
+            raise ModuleNotFoundError(
+                "dmd2.attention_grill is enabled but the `attention_grill` package is not "
+                "importable. Mount its source tree and add its `src` directory to PYTHONPATH."
+            ) from exc
+
+        report = attention_grill.replace(
+            self.model,
+            recipe=settings.recipe_path,
+            ignore=list(settings.ignore),
+        )
+        set_finite_check_policy = getattr(attention_grill, "set_finite_check_policy", None)
+        raise_if_nonfinite = getattr(attention_grill, "raise_if_nonfinite", None)
+        has_runtime_health_api = callable(set_finite_check_policy) and callable(raise_if_nonfinite)
+        if has_runtime_health_api:
+            set_finite_check_policy(settings.finite_check_policy)
+            finite_check_source = "runtime-api"
+        elif (
+            settings.finite_check_policy == "sync"
+            and report.type in _ATTENTION_GRILL_NATIVE_SYNC_TYPES
+        ):
+            finite_check_source = "backend-native"
+        else:
+            raise RuntimeError(
+                "The selected Attention Grill checkout does not expose the paired "
+                "set_finite_check_policy()/raise_if_nonfinite() runtime API. "
+                f"Kernel {report.type!r} can only be used without that API when "
+                "dmd2.attention_grill.finite_check_policy=sync and the kernel has "
+                "a native synchronous training check."
+            )
+        replaced = len(report.replaced)
+        ignored = len(report.ignored)
+        if replaced != settings.expected_replaced or ignored != settings.expected_ignored:
+            raise RuntimeError(
+                "Attention Grill replacement count mismatch on the student: "
+                f"replaced={replaced} (expected {settings.expected_replaced}), "
+                f"ignored={ignored} (expected {settings.expected_ignored}). "
+                "Check the model topology and dmd2.attention_grill.ignore patterns."
+            )
+
+        # Direct assignment avoids adding this optional, non-stateful integration object to
+        # BaseRecipe's checkpoint tracking. The backend and recipe are re-applied at startup.
+        self.__dict__["_attention_grill_module"] = attention_grill
+        self.__dict__["_attention_grill_report"] = report
+        self.__dict__["_attention_grill_finite_check_source"] = finite_check_source
+        if is_main_process():
+            logging.info("[DMD2][attention-grill] student backend installed: %s", report)
+            logging.info(
+                "[DMD2][attention-grill] finite_check_policy=%s source=%s recipe=%s",
+                settings.finite_check_policy,
+                finite_check_source,
+                report.recipe,
+            )
+        self._warmup_attention_grill(attention_grill)
+
+    def _warmup_attention_grill(self, attention_grill: Any) -> None:
+        """Preflight the selected training backend without per-node compile races."""
+        settings = self._resolve_attention_grill_settings()
+        if not settings.preflight:
+            return
+        if torch.device(self.device).type != "cuda":
+            raise ValueError(
+                "dmd2.attention_grill.preflight requires a CUDA training device; set "
+                "dmd2.attention_grill.preflight=false only for CPU wiring tests."
+            )
+
+        try:
+            local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        except ValueError as exc:
+            raise ValueError(
+                "LOCAL_RANK must be an integer for Attention Grill preflight."
+            ) from exc
+
+        report = self.__dict__["_attention_grill_report"]
+        if report.type not in _ATTENTION_GRILL_NATIVE_SYNC_TYPES:
+            raise RuntimeError(
+                "DMD2 has no direct preflight implementation for Attention Grill "
+                f"backend {report.type!r}."
+            )
+        try:
+            kernel_module = importlib.import_module(
+                "attention_grill.kernels.triton_flash_nvfp4_q4over6_smooth_qk_fp8_pv"
+            )
+            kernel = getattr(
+                kernel_module,
+                "nvfp4_q4over6_smooth_qk_fp8_pv_flash_attention",
+            )
+        except (AttributeError, ModuleNotFoundError) as exc:
+            raise RuntimeError(
+                "Attention Grill FP8-P/V preflight requires the canonical "
+                "nvfp4_q4over6_smooth_qk_fp8_pv_flash_attention function."
+            ) from exc
+
+        def _run_preflight() -> None:
+            for sequence_length in settings.preflight_sequence_lengths:
+                shape = (
+                    1,
+                    sequence_length,
+                    settings.preflight_num_heads,
+                    settings.preflight_head_dim,
+                )
+                query = torch.zeros(shape, device=self.device, dtype=torch.bfloat16)
+                key = torch.zeros_like(query)
+                value = torch.zeros_like(query)
+                # Requiring gradients selects the trainable STE wrapper: its
+                # forward compiles the corrected quantized kernel, while this
+                # VJP compiles the BF16 surrogate forward/backward used in QAT.
+                with torch.enable_grad():
+                    query.requires_grad_(True)
+                    key.requires_grad_(True)
+                    value.requires_grad_(True)
+                    output = kernel(
+                        query,
+                        key,
+                        value,
+                        scale=None,
+                        recipe=report.recipe,
+                    )
+                    torch.autograd.grad(
+                        output,
+                        (query, key, value),
+                        torch.zeros_like(output),
+                        create_graph=False,
+                    )
+                torch.cuda.synchronize(query.device)
+
+            # A deferred-capable checkout may have recorded the zero-input
+            # preflight calls. Drain that known-finite state before live training.
+            raise_if_nonfinite = getattr(attention_grill, "raise_if_nonfinite", None)
+            if settings.finite_check_policy == "deferred" and callable(raise_if_nonfinite):
+                raise_if_nonfinite()
+
+        def _run_preflight_stage(*, participate: bool, label: str) -> None:
+            local_error = None
+            if participate:
+                try:
+                    _run_preflight()
+                except Exception as exc:  # synchronize startup failure across ranks
+                    local_error = exc
+
+            any_failure = local_error is not None
+            if dist.is_initialized():
+                failure_flag = torch.tensor(
+                    int(any_failure),
+                    device=self.device,
+                    dtype=torch.int32,
+                )
+                dist.all_reduce(failure_flag, op=dist.ReduceOp.MAX)
+                any_failure = bool(failure_flag.item())
+
+            if any_failure:
+                detail = str(local_error) if local_error is not None else "failed on another rank"
+                raise RuntimeError(
+                    f"Attention Grill {label} preflight failed: {detail}"
+                ) from local_error
+
+        # One rank per node populates the node-local Triton cache first. The scalar
+        # collectives both order the stages and make every rank exit together if any
+        # compilation fails; peers cannot become stranded in a startup barrier.
+        _run_preflight_stage(participate=local_rank == 0, label="cache-population")
+        _run_preflight_stage(participate=local_rank != 0, label="cache-load")
+
+        if is_main_process():
+            logging.info(
+                "[DMD2][attention-grill] preflight complete: sequence_lengths=%s "
+                "num_heads=%d head_dim=%d",
+                settings.preflight_sequence_lengths,
+                settings.preflight_num_heads,
+                settings.preflight_head_dim,
+            )
+
+    def _raise_attention_grill_if_nonfinite(self) -> None:
+        """Surface runtime health failures before stepping when the backend defers them."""
+        settings = self._resolve_attention_grill_settings()
+        if not settings.enabled:
+            return
+
+        if self.__dict__.get("_attention_grill_finite_check_source") == "backend-native":
+            # The corrected plain-FP8-P/V wrapper already synchronized and
+            # raised at the offending attention call; no pending state exists.
+            return
+
+        attention_grill = self.__dict__["_attention_grill_module"]
+        raise_if_nonfinite = getattr(attention_grill, "raise_if_nonfinite", None)
+        if not callable(raise_if_nonfinite):
+            raise RuntimeError(
+                "Attention Grill runtime health API disappeared after backend setup."
+            )
+        if settings.finite_check_policy != "deferred":
+            raise_if_nonfinite()
+            return
+
+        # Drain locally, but do not let the first failing rank leave while its peers enter
+        # FSDP collectives. A scalar MAX makes every rank take the same failure path.
+        local_error = None
+        try:
+            raise_if_nonfinite()
+        except ValueError as exc:
+            local_error = exc
+
+        any_failure = local_error is not None
+        if dist.is_initialized():
+            failure_flag = torch.tensor(
+                int(any_failure),
+                device=self.device,
+                dtype=torch.int32,
+            )
+            dist.all_reduce(failure_flag, op=dist.ReduceOp.MAX)
+            any_failure = bool(failure_flag.item())
+
+        if any_failure:
+            detail = str(local_error) if local_error is not None else "reported by another rank"
+            raise ValueError(f"Attention Grill non-finite input detected: {detail}")
 
     def _quantize_student(self, quant_state_path: str | None) -> None:
         """Quantize the student by RESTORING a ModelOpt quantizer state from disk.
@@ -1462,6 +1858,30 @@ class DMD2DiffusionRecipe(TrainDiffusionRecipe):
     #  Inner helpers                                                     #
     # ------------------------------------------------------------------ #
 
+    def _canonicalize_attention_grill_mask(
+        self, mask: torch.Tensor | None, *, name: str
+    ) -> torch.Tensor | None:
+        """Drop a proven all-true CPU mask or reject unsupported logical padding."""
+        if mask is None or not self._resolve_attention_grill_settings().enabled:
+            return mask
+        if not torch.is_tensor(mask):
+            raise TypeError(
+                f"{name} must be a CPU tensor when dmd2.attention_grill is enabled, "
+                f"got {type(mask).__name__}."
+            )
+        if mask.device.type != "cpu":
+            raise ValueError(
+                f"{name} must be validated on CPU before device transfer when "
+                f"dmd2.attention_grill is enabled, got device={mask.device}."
+            )
+        if mask.numel() == 0 or not bool(mask.to(torch.bool).all()):
+            raise ValueError(
+                f"{name} contains masked (zero/false) positions, but the configured Attention "
+                "Grill backend supports dense unmasked attention only. Use trimmed all-valid "
+                "text embeddings with local batch size 1, or add mask/varlen kernel support."
+            )
+        return None
+
     def _set_grad_requirements(self, is_student_phase: bool) -> None:
         """Toggle train/eval + requires_grad across modules for the active phase.
 
@@ -1526,6 +1946,14 @@ class DMD2DiffusionRecipe(TrainDiffusionRecipe):
         embedding) and consumed by ``compute_student_loss`` only when CFG is
         enabled (``dmd2.guidance_scale is not None``).
         """
+        text_mask = self._canonicalize_attention_grill_mask(
+            micro_batch.get("text_embeddings_mask"), name="text_embeddings_mask"
+        )
+        negative_text_mask = self._canonicalize_attention_grill_mask(
+            micro_batch.get("negative_text_embeddings_mask"),
+            name="negative_text_embeddings_mask",
+        )
+
         if "image_latents" in micro_batch:
             latents = micro_batch["image_latents"].to(self.device, dtype=self.bf16)
         elif "video_latents" in micro_batch:
@@ -1538,7 +1966,6 @@ class DMD2DiffusionRecipe(TrainDiffusionRecipe):
         text_embeds = micro_batch["text_embeddings"].to(self.device, dtype=self.bf16)
         if text_embeds.ndim == 2:
             text_embeds = text_embeds.unsqueeze(0)
-        text_mask = micro_batch.get("text_embeddings_mask")
         if text_mask is not None:
             text_mask = text_mask.to(self.device)
             if text_mask.ndim == 1:
@@ -1548,7 +1975,6 @@ class DMD2DiffusionRecipe(TrainDiffusionRecipe):
             negative_text_embeds = negative_text_embeds.to(self.device, dtype=self.bf16)
             if negative_text_embeds.ndim == 2:
                 negative_text_embeds = negative_text_embeds.unsqueeze(0)
-        negative_text_mask = micro_batch.get("negative_text_embeddings_mask")
         if negative_text_mask is not None:
             negative_text_mask = negative_text_mask.to(self.device)
             if negative_text_mask.ndim == 1:

@@ -1236,6 +1236,16 @@ class SVDQuantConfig(QuantizeAlgorithmConfig):
         ),
     )
 
+    magnitude_gate: bool = ModeloptField(
+        default=False,
+        title="Enable a trainable output-channel magnitude gate",
+        description=(
+            "Adds a zero-initialized, per-output-channel magnitude delta to the "
+            "externalized SVDQuant PEFT branch. The gate scales the combined quantized "
+            "residual-weight and low-rank output while preserving the linear bias."
+        ),
+    )
+
     skip_layers: list[str] | None = ModeloptField(
         default=None,
         title="Module-name wildcard patterns excluded from the SVDQuant algorithm",

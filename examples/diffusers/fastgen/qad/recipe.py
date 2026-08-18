@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import shutil
 from typing import Any
 
 import torch
@@ -60,7 +61,7 @@ except ImportError as exc:
 
 from fastgen_checkpoint import make_optimizer_partial_load_tolerant
 
-from .artifacts import StudentSettings, patch_student_build
+from .artifacts import AttentionGrillSettings, StudentSettings, patch_student_build
 from .modeling import build_distillation_controller, clear_captured_outputs
 from .pipeline import QADPipeline, configure_qad_timestep_sampling
 
@@ -233,9 +234,10 @@ class QADDiffusionRecipe(TrainDiffusionRecipe):
         super().__init__(cfg)
 
     def setup(self) -> None:
-        settings, loss_config = self._resolve_qad_config()
+        settings, attention_grill, loss_config = self._resolve_qad_config()
         self.__dict__["_qad_resume_signature"] = self._resume_signature(
             settings,
+            attention_grill,
             loss_config,
         )
 
@@ -246,6 +248,11 @@ class QADDiffusionRecipe(TrainDiffusionRecipe):
             )
         if str(self.cfg.get("model.mode", "finetune")).lower() != "finetune":
             raise ValueError("QAD supports model.mode=finetune only.")
+        if attention_grill.enabled and self.cfg.get("model.attention_backend", None) is not None:
+            raise ValueError(
+                "Do not set model.attention_backend when qad.attention_grill.enabled=true; "
+                "AutoModel would overwrite the calibrated per-layer backends after FSDP."
+            )
         if self.cfg.get("ddp", None) is not None:
             raise ValueError("QAD currently supports AutoModel FSDP2, not DDP.")
         fsdp = _as_dict(self.cfg.get("fsdp"))
@@ -257,13 +264,17 @@ class QADDiffusionRecipe(TrainDiffusionRecipe):
                 "QAD currently supports data-parallel FSDP2 only; "
                 f"found model parallel sizes {model_parallel_sizes}."
             )
+        if attention_grill.enabled and bool(fsdp.get("enable_compile", False)):
+            raise ValueError(
+                "Calibrated Attention Grill QAD does not support fsdp.enable_compile=true."
+            )
 
         # Diffusers' ModelMixin must be patched before from_pretrained so both
         # regular NVFP4 and SVDQuant bundles rebuild their ModelOpt topology and
         # load component-local modelopt_state.pth before AutoModel applies FSDP.
         mto.enable_huggingface_checkpointing()
 
-        with patch_student_build(settings) as build_state:
+        with patch_student_build(settings, attention_grill) as build_state:
             super().setup()
 
         # Diffusers loads ModelMixin objects in eval mode. QAD owns the student
@@ -314,6 +325,7 @@ class QADDiffusionRecipe(TrainDiffusionRecipe):
                 QADPipeline(self.flow_matching_pipeline, controller, loss_layout),
             )
             object.__setattr__(self, "_qad_student_settings", settings)
+            object.__setattr__(self, "_qad_attention_grill_settings", attention_grill)
             object.__setattr__(self, "_qad_loss_config", loss_config)
             object.__setattr__(self, "_qad_timestep_summary", timestep_summary)
 
@@ -339,6 +351,16 @@ class QADDiffusionRecipe(TrainDiffusionRecipe):
                 loss_config["output_weight"],
                 loss_config["layerwise_config"],
             )
+            if build_state.attention_grill_summary is not None:
+                summary = build_state.attention_grill_summary
+                logging.info(
+                    "[QAD] Attention Grill is frozen/non-persistent: kernel=%s "
+                    "replaced=%d ignored=%d calibration=%s",
+                    summary["kernel"],
+                    len(summary["replaced"]),
+                    len(summary["ignored"]),
+                    summary["calibration_path"],
+                )
             if loss_config["layerwise_config"]["selection"] == "quantized_blocks":
                 logging.info(
                     "[QAD] blockwise distillation targets %d discovered blocks: %s",
@@ -355,13 +377,53 @@ class QADDiffusionRecipe(TrainDiffusionRecipe):
         flow_matching: dict[str, Any],
     ) -> dict[str, Any]:
         timestep = _as_dict(qad.get("timestep"))
+        supported_keys = {
+            "schedule",
+            "num_inference_steps",
+            "inference_step_start",
+            "inference_step_end",
+            "image_seq_len",
+        }
+        unknown_keys = set(timestep) - supported_keys
+        if unknown_keys:
+            raise ValueError(
+                "Unsupported qad.timestep field(s): " + ", ".join(sorted(unknown_keys))
+            )
         schedule = str(timestep.get("schedule", "")).lower()
         if schedule not in {"qwen_image", "qwen_image_flash"}:
             raise ValueError("qad.timestep.schedule must be qwen_image or qwen_image_flash.")
 
         config: dict[str, Any] = {"schedule": schedule}
         if schedule == "qwen_image_flash":
+            if "image_seq_len" in timestep:
+                raise ValueError("qad.timestep.image_seq_len applies only to schedule=qwen_image.")
             config["num_inference_steps"] = 4
+            if int(timestep.get("num_inference_steps", 4)) != 4:
+                raise ValueError("Qwen-Image-Flash QAD requires num_inference_steps=4.")
+            range_keys = {"inference_step_start", "inference_step_end"}
+            provided_range_keys = range_keys & set(timestep)
+            if provided_range_keys:
+                if provided_range_keys != range_keys:
+                    missing = range_keys - provided_range_keys
+                    raise ValueError(
+                        "Qwen-Image-Flash timestep range is missing: " + ", ".join(sorted(missing))
+                    )
+                start_step = int(timestep["inference_step_start"])
+                end_step = int(timestep["inference_step_end"])
+                if not 0 <= start_step < end_step <= 4:
+                    raise ValueError(
+                        "Qwen-Image-Flash timestep range must satisfy 0 <= start < end <= 4."
+                    )
+                config["inference_step_range"] = {
+                    "num_inference_steps": 4,
+                    "start": start_step,
+                    "end": end_step,
+                }
+            elif "num_inference_steps" in timestep:
+                raise ValueError(
+                    "qad.timestep.num_inference_steps requires both "
+                    "inference_step_start and inference_step_end."
+                )
             return config
 
         sampling = str(flow_matching.get("timestep_sampling", "logit_normal")).lower()
@@ -382,9 +444,92 @@ class QADDiffusionRecipe(TrainDiffusionRecipe):
                 "num_train_timesteps": int(flow_matching.get("num_train_timesteps", 1000)),
             }
         )
+
+        range_keys = {"inference_step_start", "inference_step_end"}
+        provided_range_keys = range_keys & set(timestep)
+        if provided_range_keys:
+            if provided_range_keys != range_keys:
+                missing = range_keys - provided_range_keys
+                raise ValueError(
+                    "Qwen-Image timestep range is missing: " + ", ".join(sorted(missing))
+                )
+            if sampling != "uniform":
+                raise ValueError(
+                    "Qwen-Image inference-step ranges require "
+                    "flow_matching.timestep_sampling=uniform."
+                )
+            num_inference_steps = int(timestep.get("num_inference_steps", 50))
+            start_step = int(timestep["inference_step_start"])
+            end_step = int(timestep["inference_step_end"])
+            image_seq_len = int(timestep.get("image_seq_len", 4096))
+            if num_inference_steps <= 0:
+                raise ValueError("qad.timestep.num_inference_steps must be positive.")
+            if not 0 <= start_step < end_step <= num_inference_steps:
+                raise ValueError(
+                    "Qwen-Image inference-step range must satisfy "
+                    "0 <= start < end <= num_inference_steps."
+                )
+            if image_seq_len <= 0:
+                raise ValueError("qad.timestep.image_seq_len must be positive.")
+            config["inference_step_range"] = {
+                "num_inference_steps": num_inference_steps,
+                "start": start_step,
+                "end": end_step,
+                "image_seq_len": image_seq_len,
+            }
+        elif {"num_inference_steps", "image_seq_len"} & set(timestep):
+            raise ValueError(
+                "qad.timestep.num_inference_steps/image_seq_len require both "
+                "inference_step_start and inference_step_end."
+            )
         return config
 
-    def _resolve_qad_config(self) -> tuple[StudentSettings, dict[str, Any]]:
+    @staticmethod
+    def _resolve_attention_grill_config(
+        qad: dict[str, Any],
+        timestep_config: dict[str, Any],
+    ) -> AttentionGrillSettings:
+        config = _as_dict(qad.get("attention_grill"))
+        supported_keys = {
+            "enabled",
+            "recipe_path",
+            "calibration_path",
+            "ignore",
+            "expected_replaced",
+            "expected_ignored",
+        }
+        unknown_keys = set(config) - supported_keys
+        if unknown_keys:
+            raise ValueError(
+                "Unsupported qad.attention_grill field(s): " + ", ".join(sorted(unknown_keys))
+            )
+
+        raw_ignore = config.get("ignore", ())
+        if isinstance(raw_ignore, str):
+            ignore = (raw_ignore,)
+        else:
+            ignore = tuple(str(pattern) for pattern in raw_ignore)
+        settings = AttentionGrillSettings(
+            enabled=bool(config.get("enabled", False)),
+            recipe_path=(
+                str(config["recipe_path"]) if config.get("recipe_path") is not None else None
+            ),
+            calibration_path=(
+                str(config["calibration_path"])
+                if config.get("calibration_path") is not None
+                else None
+            ),
+            ignore=ignore,
+            expected_replaced=int(config.get("expected_replaced", 56)),
+            expected_ignored=int(config.get("expected_ignored", 4)),
+            inference_profile=str(timestep_config["schedule"]),
+        )
+        settings.validate()
+        return settings
+
+    def _resolve_qad_config(
+        self,
+    ) -> tuple[StudentSettings, AttentionGrillSettings, dict[str, Any]]:
         qad = _as_dict(self.cfg.get("qad", None))
         if not qad:
             raise ValueError("Missing required qad configuration block.")
@@ -435,6 +580,7 @@ class QADDiffusionRecipe(TrainDiffusionRecipe):
             qad,
             _as_dict(self.cfg.get("flow_matching", {})),
         )
+        attention_grill = self._resolve_attention_grill_config(qad, timestep_config)
 
         output_cfg = _as_dict(qad.get("output_loss"))
         if str(output_cfg.get("type", "mse")).lower() != "mse":
@@ -455,13 +601,17 @@ class QADDiffusionRecipe(TrainDiffusionRecipe):
         if not any(weight > 0.0 for weight in all_weights):
             raise ValueError("At least one QAD loss weight must be positive.")
 
-        return settings, {
-            "teacher_model_name_or_path": str(teacher_model_name_or_path),
-            "output_weight": output_weight,
-            "task_weight": task_weight,
-            "layerwise_config": layerwise_config,
-            "timestep_config": timestep_config,
-        }
+        return (
+            settings,
+            attention_grill,
+            {
+                "teacher_model_name_or_path": str(teacher_model_name_or_path),
+                "output_weight": output_weight,
+                "task_weight": task_weight,
+                "layerwise_config": layerwise_config,
+                "timestep_config": timestep_config,
+            },
+        )
 
     @staticmethod
     def _layerwise_resume_signature(layerwise: dict[str, Any]) -> tuple[Any, ...]:
@@ -495,8 +645,20 @@ class QADDiffusionRecipe(TrainDiffusionRecipe):
     @staticmethod
     def _resume_signature(
         settings: StudentSettings,
+        attention_grill: AttentionGrillSettings,
         loss_config: dict[str, Any],
     ) -> dict[str, Any]:
+        if attention_grill.enabled:
+            attention_grill_signature: tuple[Any, ...] = (
+                "enabled",
+                os.path.realpath(str(attention_grill.recipe_path)),
+                os.path.realpath(str(attention_grill.calibration_path)),
+                attention_grill.ignore,
+                attention_grill.expected_replaced,
+                attention_grill.expected_ignored,
+            )
+        else:
+            attention_grill_signature = ("disabled",)
         return {
             "student_source": settings.model_name_or_path,
             "student_mode": settings.mode,
@@ -505,6 +667,7 @@ class QADDiffusionRecipe(TrainDiffusionRecipe):
             "output_weight": float(loss_config["output_weight"]),
             "task_weight": float(loss_config["task_weight"]),
             "timestep_config": loss_config["timestep_config"],
+            "attention_grill": attention_grill_signature,
             "layerwise": QADDiffusionRecipe._layerwise_resume_signature(
                 loss_config["layerwise_config"]
             ),
@@ -533,6 +696,7 @@ class QADDiffusionRecipe(TrainDiffusionRecipe):
             qad_cfg,
             _as_dict(config.get("flow_matching")),
         )
+        attention_grill = cls._resolve_attention_grill_config(qad_cfg, timestep_config)
 
         mode = str(student_cfg.get("mode", "nvfp4")).lower()
         if mode == "svdquant_nvfp4":
@@ -549,7 +713,7 @@ class QADDiffusionRecipe(TrainDiffusionRecipe):
             model_name_or_path=str(model_cfg.get("pretrained_model_name_or_path", "")),
             train_scope=str(student_cfg.get("train_scope", "all")).lower(),
         )
-        return cls._resume_signature(settings, loss_config)
+        return cls._resume_signature(settings, attention_grill, loss_config)
 
     def _resolved_checkpoint_dir(self, restore_from: str | None) -> str | None:
         if not self.checkpointer.config.enabled:
@@ -596,6 +760,68 @@ class QADDiffusionRecipe(TrainDiffusionRecipe):
             self._validate_qad_checkpoint_signature(checkpoint_dir)
             make_optimizer_partial_load_tolerant(self.checkpointer)
         super().load_checkpoint(restore_from)
+
+    def _remove_incomplete_checkpoint_target(self, epoch: int, global_step: int) -> None:
+        """Remove a directory left behind by an interrupted checkpoint save."""
+        if not self.checkpointer.config.enabled:
+            return
+
+        checkpoint_root = os.fspath(self.checkpointer.config.checkpoint_dir)
+        checkpoint_name = f"epoch_{epoch}_step_{global_step}"
+        checkpoint_path = os.path.join(checkpoint_root, checkpoint_name)
+        cleanup_outcome: tuple[str, str] | None = None
+
+        if is_main_process() and os.path.lexists(checkpoint_path):
+            latest_path = os.path.join(checkpoint_root, "LATEST")
+            latest_target = os.path.realpath(latest_path) if os.path.lexists(latest_path) else None
+            if latest_target == os.path.realpath(checkpoint_path):
+                cleanup_outcome = (
+                    "refuse",
+                    f"Refusing to overwrite the current QAD checkpoint: {checkpoint_path}",
+                )
+            else:
+                # AutoModel writes config.yaml and optimizer DCP metadata before
+                # it advances LATEST. Their absence identifies the half-written
+                # directory produced when a distributed save is interrupted.
+                complete_markers = (
+                    os.path.join(checkpoint_path, "config.yaml"),
+                    os.path.join(checkpoint_path, "optim", ".metadata"),
+                )
+                if all(os.path.isfile(marker) for marker in complete_markers):
+                    cleanup_outcome = (
+                        "refuse",
+                        "Refusing to remove an apparently complete QAD checkpoint that is "
+                        f"not LATEST: {checkpoint_path}",
+                    )
+                else:
+                    logging.warning(
+                        "[QAD][checkpoint] removing incomplete checkpoint left by an "
+                        "interrupted save: %s",
+                        checkpoint_path,
+                    )
+                    try:
+                        shutil.rmtree(checkpoint_path)
+                    except Exception as exc:
+                        cleanup_outcome = (
+                            "cleanup_failed",
+                            f"{type(exc).__name__}: {exc}",
+                        )
+
+        if torch.distributed.is_initialized():
+            payload = [cleanup_outcome]
+            torch.distributed.broadcast_object_list(payload, src=0)
+            cleanup_outcome = payload[0]
+
+        if cleanup_outcome is not None:
+            outcome, message = cleanup_outcome
+            if outcome == "refuse":
+                raise FileExistsError(message)
+            raise RuntimeError(
+                f"Rank 0 failed to remove incomplete checkpoint {checkpoint_path}: {message}"
+            )
+
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
 
     def _rebuild_dataloader_for_resume(self, global_step: int) -> None:
         """Rebuild the loader and deterministically skip to the restored data position."""
@@ -799,6 +1025,7 @@ class QADDiffusionRecipe(TrainDiffusionRecipe):
                             )
 
                     if self.step_scheduler.is_ckpt_step:
+                        self._remove_incomplete_checkpoint_target(epoch, global_step)
                         self.save_checkpoint(epoch, global_step, epoch_loss / num_steps)
 
                 if num_steps == 0:
@@ -824,6 +1051,72 @@ class QADDiffusionRecipe(TrainDiffusionRecipe):
         trainable = [parameter for parameter in self.model.parameters() if parameter.requires_grad]
         if not any(parameter.grad is not None for parameter in trainable):
             raise RuntimeError("QAD produced no gradients for any trainable student parameter.")
+
+        attention_grill = self._qad_attention_grill_settings
+        if attention_grill.enabled:
+            missing_projection_gradients: list[str] = []
+            bound_attention_count = 0
+            projection_grad_sq = torch.zeros(3, device=self.device, dtype=torch.float32)
+            for module_name, module in self.model.named_modules():
+                processor = getattr(module, "processor", None)
+                if processor is None or not hasattr(processor, "_grill_bound_backend_handle"):
+                    continue
+                bound_attention_count += 1
+                for projection_index, projection_name in enumerate(("to_q", "to_k", "to_v")):
+                    projection = getattr(module, projection_name, None)
+                    projection_parameters = (
+                        tuple(
+                            parameter
+                            for parameter in projection.parameters()
+                            if parameter.requires_grad
+                        )
+                        if projection is not None
+                        else ()
+                    )
+                    if not projection_parameters or not any(
+                        parameter.grad is not None for parameter in projection_parameters
+                    ):
+                        missing_projection_gradients.append(f"{module_name}.{projection_name}")
+                    for parameter in projection_parameters:
+                        gradient = parameter.grad
+                        if gradient is None:
+                            continue
+                        if hasattr(gradient, "to_local"):
+                            gradient = gradient.to_local()
+                        projection_grad_sq[projection_index] += (
+                            gradient.detach().float().square().sum()
+                        )
+
+            local_ok = (
+                bound_attention_count == attention_grill.expected_replaced
+                and not missing_projection_gradients
+            )
+            if torch.distributed.is_initialized():
+                torch.distributed.all_reduce(
+                    projection_grad_sq,
+                    op=torch.distributed.ReduceOp.SUM,
+                )
+                global_ok = torch.tensor(int(local_ok), device=self.device)
+                torch.distributed.all_reduce(
+                    global_ok,
+                    op=torch.distributed.ReduceOp.MIN,
+                )
+                local_ok = bool(global_ok.item())
+            if not local_ok:
+                details = ", ".join(missing_projection_gradients[:5]) or "failure on a peer rank"
+                raise RuntimeError(
+                    "Calibrated Attention Grill did not propagate first-step gradients "
+                    f"through every Q/K/V projection ({details})."
+                )
+            if is_main_process():
+                projection_grad_norms = projection_grad_sq.sqrt().tolist()
+                logging.info(
+                    "[QAD] verified Attention Grill STE gradients through Q/K/V in %d "
+                    "blocks: to_q=%.6e to_k=%.6e to_v=%.6e",
+                    bound_attention_count,
+                    *projection_grad_norms,
+                )
+
         if self._qad_student_settings.train_scope == "lora_only":
             missing = [
                 name

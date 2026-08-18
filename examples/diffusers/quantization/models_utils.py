@@ -14,7 +14,7 @@
 # limitations under the License.
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from enum import Enum
 from typing import Any
 
@@ -39,6 +39,7 @@ try:
 except ImportError:
     QwenImagePipeline = None
 from utils import (
+    QWEN_IMAGE_FULL_PRECISION_MODULES,
     filter_func_default,
     filter_func_flux_dev,
     filter_func_ltx2_vae,
@@ -257,20 +258,22 @@ MODEL_DEFAULTS: dict[ModelType, dict[str, Any]] = {
             "height": 1024,
             "width": 1024,
         },
-        # Quantize only ``transformer_blocks``; keep the first 2 and last 2 blocks
-        # (and everything outside ``transformer_blocks``) in original precision.
-        # Applied before calibration via ``build_block_range_quant_cfg`` so SVDQuant
-        # never mutates the excluded blocks' weights.
+        # Quantize only ``transformer_blocks``; keep the first 2 and last 2 blocks,
+        # the listed norm/modulation modules, and everything outside
+        # ``transformer_blocks`` in original precision. Applied before calibration
+        # via ``build_block_range_quant_cfg`` so SVDQuant never mutates excluded
+        # weights.
         "block_range": {
             "exclude_first_n": 2,
             "exclude_last_n": 2,
             "block_module": "transformer_blocks",
+            "full_precision_modules": QWEN_IMAGE_FULL_PRECISION_MODULES,
         },
         # The text-stream linears (joint-attention added-KV projections and the
-        # txt MLP) and the modulation linears cannot use the SVDQuant low-rank
-        # branch; they are exported as plain NVFP4 instead (no pre_quant_scale,
-        # no svdquant_lora_a/b). The remaining image-stream linears keep full
-        # SVDQuant.
+        # txt MLP) cannot use the SVDQuant low-rank branch; they are quantized as
+        # plain NVFP4 instead (no pre_quant_scale, no svdquant_lora_a/b). The
+        # remaining image-stream linears keep full SVDQuant. Modulation linears
+        # are fully excluded above rather than downgraded to plain NVFP4.
         "svdquant_skip_layers": [
             "*.attn.add_q_proj",
             "*.attn.add_k_proj",
@@ -278,8 +281,6 @@ MODEL_DEFAULTS: dict[ModelType, dict[str, Any]] = {
             "*.attn.to_add_out",
             "*.txt_mlp.net.0.proj",
             "*.txt_mlp.net.2",
-            "*.img_mod.1",
-            "*.txt_mod.1",
         ],
     },
 }
@@ -343,12 +344,14 @@ def build_block_range_quant_cfg(
     exclude_first_n: int,
     exclude_last_n: int,
     block_module: str = "transformer_blocks",
+    full_precision_modules: Sequence[str] = (),
 ) -> list[dict[str, Any]]:
     """Build ordered ``quant_cfg`` rules for a transformer-block-only recipe.
 
     The rules quantize only the linears under ``block_module`` while keeping the
-    first ``exclude_first_n`` and last ``exclude_last_n`` blocks -- and everything
-    outside ``block_module`` -- in original precision.
+    first ``exclude_first_n`` and last ``exclude_last_n`` blocks, the named
+    ``full_precision_modules`` within the remaining blocks, and everything
+    outside ``block_module`` in original precision.
 
     The rules are meant to be appended to the ``quant_cfg`` list consumed by
     ``mtq.quantize`` so the selection is applied BEFORE calibration. This is
@@ -361,7 +364,8 @@ def build_block_range_quant_cfg(
     1. disable every linear weight/input quantizer,
     2. re-enable only those under ``block_module`` (``enable`` is a top-level
        QuantizerCfgEntry toggle; a ``None`` cfg keeps the base preset's quant params),
-    3. disable the first/last ``n`` blocks.
+    3. disable the first/last ``n`` blocks,
+    4. disable every quantizer under each named full-precision module.
 
     Raises:
         ValueError: if the backbone has no ``block_module`` list, or it has fewer
@@ -404,4 +408,13 @@ def build_block_range_quant_cfg(
             {"quantizer_name": f"*{block_module}.{idx}.*weight_quantizer", "enable": False}
         )
         rules.append({"quantizer_name": f"*{block_module}.{idx}.*input_quantizer", "enable": False})
+    rules.extend(
+        [
+            {
+                "quantizer_name": f"*{block_module}.*.{module_name}.*quantizer",
+                "enable": False,
+            }
+            for module_name in full_precision_modules
+        ]
+    )
     return rules

@@ -25,7 +25,7 @@ from modelopt.torch.quantization.plugins.svdquant_peft import (
 class _TinyMLP(nn.Module):
     def __init__(self):
         super().__init__()
-        self.svdquant = nn.Linear(8, 8, bias=False)
+        self.svdquant = nn.Linear(8, 8, bias=True)
         self.skipped = nn.Linear(8, 8, bias=False)
         self.disabled = nn.Linear(8, 8, bias=False)
 
@@ -35,12 +35,13 @@ class _TinyMLP(nn.Module):
         return self.disabled(x)
 
 
-def _svdquant_config(*, select_one_target=False):
+def _svdquant_config(*, select_one_target=False, magnitude_gate=False):
     config = copy.deepcopy(mtq.INT8_SMOOTHQUANT_CFG)
     config["algorithm"] = {
         "method": "svdquant",
         "lowrank": 4,
         "skip_layers": ["skipped"] if select_one_target else None,
+        "magnitude_gate": magnitude_gate,
     }
     if select_one_target:
         # A disabled weight quantizer must not cause PEFT injection either.
@@ -48,12 +49,15 @@ def _svdquant_config(*, select_one_target=False):
     return config
 
 
-def _quantize(model, *, select_one_target=False):
+def _quantize(model, *, select_one_target=False, magnitude_gate=False):
     reference = next(model.parameters())
     calibration_input = torch.randn(4, 8, device=reference.device, dtype=reference.dtype)
     return mtq.quantize(
         model,
-        _svdquant_config(select_one_target=select_one_target),
+        _svdquant_config(
+            select_one_target=select_one_target,
+            magnitude_gate=magnitude_gate,
+        ),
         forward_loop=lambda current: current(calibration_input),
     )
 
@@ -86,6 +90,7 @@ def test_svdquant_peft_uses_exact_targets_and_preserves_unquantized_forward():
     assert not isinstance(model.skipped, _SVDQuantPeftLinear)
     assert not isinstance(model.disabled, _SVDQuantPeftLinear)
     assert _svdquant_metadata(model)["target_modules"] == ["svdquant"]
+    assert "magnitude_gate_version" not in _svdquant_metadata(model)
 
     adapter = model.svdquant
     base_layer = adapter.get_base_layer()
@@ -95,6 +100,7 @@ def test_svdquant_peft_uses_exact_targets_and_preserves_unquantized_forward():
     assert list(adapter.active_adapters) == [_SVDQUANT_ADAPTER_NAME]
     assert adapter.lora_A[_SVDQUANT_ADAPTER_NAME].weight.requires_grad
     assert adapter.lora_B[_SVDQUANT_ADAPTER_NAME].weight.requires_grad
+    assert not hasattr(adapter, "svdquant_magnitude_delta")
     assert not model.disabled.weight_quantizer.is_enabled
 
     # Both branches see the same AWQ-scaled input, while output quantization applies only
@@ -125,6 +131,59 @@ def test_svdquant_peft_uses_exact_targets_and_preserves_unquantized_forward():
     bf16_adapter = bf16_model.svdquant
     assert bf16_adapter.lora_A[_SVDQUANT_ADAPTER_NAME].weight.dtype == torch.bfloat16
     assert bf16_adapter.lora_B[_SVDQUANT_ADAPTER_NAME].weight.dtype == torch.bfloat16
+
+
+def test_svdquant_magnitude_gate_is_identity_trainable_and_restorable():
+    torch.manual_seed(23)
+    model = _quantize(_TinyMLP(), select_one_target=True, magnitude_gate=True)
+    adapter = model.svdquant
+    magnitude_delta = adapter.svdquant_magnitude_delta
+
+    assert _svdquant_metadata(model)["magnitude_gate_version"] == 1
+    assert tuple(magnitude_delta.shape) == (adapter.get_base_layer().out_features,)
+    assert magnitude_delta.requires_grad
+    assert torch.count_nonzero(magnitude_delta) == 0
+
+    probe = torch.randn(3, 8)
+    identity_output = adapter(probe).detach().clone()
+    bias = adapter.get_base_layer().bias.detach()
+    with torch.no_grad():
+        magnitude_delta.fill_(0.25)
+    expected_gated_output = identity_output + (identity_output - bias) * 0.25
+    torch.testing.assert_close(adapter(probe), expected_gated_output, rtol=1e-6, atol=1e-6)
+
+    optimizer = torch.optim.SGD([magnitude_delta], lr=5e-2)
+    optimizer.zero_grad(set_to_none=True)
+    adapter(probe).square().mean().backward()
+    assert magnitude_delta.grad is not None
+    optimizer.step()
+
+    expected_delta = magnitude_delta.detach().clone()
+    expected_output = model(probe).detach().clone()
+    checkpoint = io.BytesIO()
+    mto.save(model, checkpoint)
+    checkpoint.seek(0)
+    restored = mto.restore(_TinyMLP(), checkpoint)
+    assert torch.equal(restored.svdquant.svdquant_magnitude_delta, expected_delta)
+    torch.testing.assert_close(restored(probe), expected_output, rtol=0, atol=0)
+
+    modelopt_state = copy.deepcopy(mto.modelopt_state(model))
+    model_state = copy.deepcopy(model.state_dict())
+    manually_restored = mto.restore_from_modelopt_state(_TinyMLP(), modelopt_state)
+    manually_restored.load_state_dict(model_state)
+    assert torch.equal(manually_restored.svdquant.svdquant_magnitude_delta, expected_delta)
+    torch.testing.assert_close(manually_restored(probe), expected_output, rtol=0, atol=0)
+
+
+def test_svdquant_magnitude_gate_rejects_unknown_version():
+    model = _quantize(_TinyMLP(), select_one_target=True)
+    modelopt_state = copy.deepcopy(mto.modelopt_state(model))
+    for mode_name, mode_state in modelopt_state["modelopt_state_dict"]:
+        if mode_name == "svdquant_calibrate":
+            mode_state["metadata"]["svdquant_peft"]["magnitude_gate_version"] = 2
+
+    with pytest.raises(ValueError, match="Unsupported SVDQuant magnitude gate version: 2"):
+        mto.restore_from_modelopt_state(_TinyMLP(), modelopt_state)
 
 
 def test_mto_save_restore_preserves_qat_mutated_factors():

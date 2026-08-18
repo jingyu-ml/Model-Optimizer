@@ -41,6 +41,8 @@ def set_quant_config_attr(quant_config, trt_high_precision_dtype, quant_algo, **
     elif quant_algo == "svdquant":
         if "lowrank" in kwargs:
             algo_cfg["lowrank"] = kwargs["lowrank"]
+        if kwargs.get("magnitude_gate"):
+            algo_cfg["magnitude_gate"] = True
         # Layers excluded from the SVDQuant algorithm (no AWQ smoothing, no
         # low-rank branch); they stay quantized with plain max calibration.
         if kwargs.get("skip_layers"):

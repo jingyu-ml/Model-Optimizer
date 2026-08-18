@@ -39,10 +39,12 @@ class _DiscreteTimestepSampler:
         timesteps: torch.Tensor,
         sigmas: torch.Tensor,
         default_device: torch.device,
+        sampling_method: str,
     ) -> None:
         self._cpu_timesteps = timesteps.detach().to(device="cpu", dtype=torch.float32)
         self._cpu_sigmas = sigmas.detach().to(device="cpu", dtype=torch.float32)
         self._default_device = default_device
+        self._sampling_method = sampling_method
         self._device_cache: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
 
     def sample_timesteps(
@@ -58,7 +60,35 @@ class _DiscreteTimestepSampler:
             )
         sigmas, timesteps = self._device_cache[target_device]
         indices = torch.randint(len(timesteps), (batch_size,), device=target_device)
-        return sigmas[indices], timesteps[indices], "qwen_image_flash_inference_rungs"
+        return sigmas[indices], timesteps[indices], self._sampling_method
+
+
+class _ContinuousTimestepRangeSampler:
+    def __init__(
+        self,
+        *,
+        sigma_min: float,
+        sigma_max: float,
+        num_train_timesteps: int,
+        default_device: torch.device,
+        sampling_method: str,
+    ) -> None:
+        self._sigma_min = sigma_min
+        self._sigma_max = sigma_max
+        self._num_train_timesteps = num_train_timesteps
+        self._default_device = default_device
+        self._sampling_method = sampling_method
+
+    def sample_timesteps(
+        self,
+        batch_size: int,
+        device: torch.device | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, str]:
+        target_device = torch.device(device) if device is not None else self._default_device
+        sigmas = torch.rand(batch_size, device=target_device, dtype=torch.float32)
+        sigmas = self._sigma_min + sigmas * (self._sigma_max - self._sigma_min)
+        timesteps = sigmas * self._num_train_timesteps
+        return sigmas, timesteps, self._sampling_method
 
 
 def _validate_scheduler_config(
@@ -141,6 +171,59 @@ def configure_qad_timestep_sampling(
         )
 
     if schedule == "qwen_image":
+        inference_step_range = timestep_config.get("inference_step_range")
+        if inference_step_range is not None:
+            num_inference_steps = int(inference_step_range["num_inference_steps"])
+            start_step = int(inference_step_range["start"])
+            end_step = int(inference_step_range["end"])
+            image_seq_len = int(inference_step_range["image_seq_len"])
+
+            base_seq_len = int(scheduler.config.base_image_seq_len)
+            max_seq_len = int(scheduler.config.max_image_seq_len)
+            base_shift = float(scheduler.config.base_shift)
+            max_shift = float(scheduler.config.max_shift)
+            shift_slope = (max_shift - base_shift) / (max_seq_len - base_seq_len)
+            shift_intercept = base_shift - shift_slope * base_seq_len
+            mu = image_seq_len * shift_slope + shift_intercept
+
+            # Match QwenImagePipeline: N evaluation sigmas from 1 to 1/N,
+            # followed by the scheduler's terminal sigma. A [start, end)
+            # denoising-step slice is therefore bounded by sigmas[start] and
+            # sigmas[end].
+            raw_sigmas = np.linspace(
+                1.0,
+                1.0 / num_inference_steps,
+                num_inference_steps,
+            ).tolist()
+            scheduler.set_timesteps(sigmas=raw_sigmas, mu=mu)
+            inference_sigmas = scheduler.sigmas.detach().to(device="cpu", dtype=torch.float32)
+            sigma_max = float(inference_sigmas[start_step].item())
+            sigma_min = float(inference_sigmas[end_step].item())
+            if not 0.0 <= sigma_min < sigma_max <= 1.0:
+                raise ValueError(
+                    "Qwen-Image inference-step range produced invalid sigma bounds: "
+                    f"[{sigma_min}, {sigma_max}]."
+                )
+
+            sampling_method = f"qwen_image_inference_steps_{start_step}_to_{end_step}_uniform"
+            sampler = _ContinuousTimestepRangeSampler(
+                sigma_min=sigma_min,
+                sigma_max=sigma_max,
+                num_train_timesteps=int(scheduler.config.num_train_timesteps),
+                default_device=flow_matching_pipeline.device,
+                sampling_method=sampling_method,
+            )
+            flow_matching_pipeline.sample_timesteps = sampler.sample_timesteps
+            return {
+                **timestep_config,
+                "scheduler_class": type(scheduler).__name__,
+                "dynamic_shift_mu": mu,
+                "sampled_sigma_min": sigma_min,
+                "sampled_sigma_max": sigma_max,
+                "sampled_timestep_min": sigma_min * scheduler.config.num_train_timesteps,
+                "sampled_timestep_max": sigma_max * scheduler.config.num_train_timesteps,
+                "sampling_method": sampling_method,
+            }
         return {
             **timestep_config,
             "scheduler_class": type(scheduler).__name__,
@@ -169,10 +252,24 @@ def configure_qad_timestep_sampling(
             f"schedule: timesteps={timesteps.tolist()} sigmas={sigmas.tolist()}."
         )
 
+    inference_step_range = timestep_config.get("inference_step_range")
+    if inference_step_range is None:
+        start_step, end_step = 0, len(timesteps)
+    else:
+        start_step = int(inference_step_range["start"])
+        end_step = int(inference_step_range["end"])
+    selected_timesteps = timesteps[start_step:end_step]
+    selected_sigmas = sigmas[start_step:end_step]
+    sampling_method = (
+        "qwen_image_flash_inference_rungs"
+        if (start_step, end_step) == (0, len(timesteps))
+        else f"qwen_image_flash_inference_steps_{start_step}_to_{end_step}_discrete"
+    )
     sampler = _DiscreteTimestepSampler(
-        timesteps=timesteps,
-        sigmas=sigmas[:-1],
+        timesteps=selected_timesteps,
+        sigmas=selected_sigmas,
         default_device=flow_matching_pipeline.device,
+        sampling_method=sampling_method,
     )
     flow_matching_pipeline.sample_timesteps = sampler.sample_timesteps
     return {
@@ -180,6 +277,10 @@ def configure_qad_timestep_sampling(
         "scheduler_class": type(scheduler).__name__,
         "timesteps": timesteps.tolist(),
         "sigmas": sigmas.tolist(),
+        "sampled_step_indices": list(range(start_step, end_step)),
+        "sampled_timesteps": selected_timesteps.tolist(),
+        "sampled_sigmas": selected_sigmas.tolist(),
+        "sampling_method": sampling_method,
     }
 
 
@@ -221,8 +322,14 @@ class QADPipeline:
             skip_balancer=True,
         )
         total = self.controller.loss_balancer(losses)
-        if check_loss and not bool(torch.isfinite(total.detach()).all()):
-            raise FloatingPointError(f"Non-finite QAD loss at step {global_step}.")
+        if check_loss:
+            finite = torch.isfinite(total.detach()).all().to(dtype=torch.int32)
+            if torch.distributed.is_initialized():
+                torch.distributed.all_reduce(finite, op=torch.distributed.ReduceOp.MIN)
+            if not bool(finite.item()):
+                raise FloatingPointError(
+                    f"Non-finite QAD loss on at least one rank at step {global_step}."
+                )
 
         kd_values = [value for key, value in losses.items() if key != "student_loss"]
         if len(kd_values) != len(self.loss_layout.names):

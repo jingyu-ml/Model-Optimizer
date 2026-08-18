@@ -118,26 +118,43 @@ def filter_func_wan_video(name: str) -> bool:
 
 # Qwen-Image's transformer has 60 ``transformer_blocks``. The recipe quantizes
 # only those blocks while keeping the first two and last two -- and everything
-# outside ``transformer_blocks`` -- in original precision. The model-agnostic,
-# config-driven form of this recipe (deriving the block count from the model)
-# lives in quantize.py; this name-only filter covers the plain FP8/NVFP4 path
-# for the full 60-block Qwen-Image transformer.
+# outside ``transformer_blocks`` -- in original precision. Norm and modulation
+# modules in the quantized middle blocks also stay in original precision. The
+# model-agnostic, config-driven form of this recipe (deriving the block count
+# from the model) lives in quantize.py; this name-only filter covers the plain
+# FP8/NVFP4 path for the full 60-block Qwen-Image transformer.
 QWEN_IMAGE_NUM_TRANSFORMER_BLOCKS = 60
+QWEN_IMAGE_FULL_PRECISION_MODULES = (
+    "img_norm1",
+    "img_norm2",
+    "txt_norm1",
+    "txt_norm2",
+    "img_mod.1",
+    "txt_mod.1",
+)
 _QWEN_IMAGE_BLOCK_RE = re.compile(r"(?:^|\.)transformer_blocks\.(\d+)(?:\.|$)")
+_QWEN_IMAGE_FULL_PRECISION_RE = re.compile(
+    rf"(?:^|\.)(?:{'|'.join(re.escape(name) for name in QWEN_IMAGE_FULL_PRECISION_MODULES)})(?:\.|$)"
+)
 
 
 def filter_func_qwen_image(name: str) -> bool:
     """Filter function specifically for Qwen-Image models.
 
     Returns ``True`` for modules to keep in original precision (quantization
-    disabled): everything outside ``transformer_blocks``, plus the first two and
-    last two transformer blocks.
+    disabled): everything outside ``transformer_blocks``, the first two and last
+    two transformer blocks, and the norm/modulation modules listed in
+    ``QWEN_IMAGE_FULL_PRECISION_MODULES``.
     """
     match = _QWEN_IMAGE_BLOCK_RE.search(name)
     if match is None:
         return True
     block_idx = int(match.group(1))
-    return block_idx < 2 or block_idx >= QWEN_IMAGE_NUM_TRANSFORMER_BLOCKS - 2
+    return (
+        block_idx < 2
+        or block_idx >= QWEN_IMAGE_NUM_TRANSFORMER_BLOCKS - 2
+        or _QWEN_IMAGE_FULL_PRECISION_RE.search(name) is not None
+    )
 
 
 def load_calib_prompts(

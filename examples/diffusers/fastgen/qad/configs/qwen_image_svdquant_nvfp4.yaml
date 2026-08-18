@@ -28,13 +28,43 @@ step_scheduler:
   max_steps: 50000
 
 qad:
-  # Keep the teacher independent from the quantized student bundle.
-  teacher_model_name_or_path: Qwen/Qwen-Image
+  # QAD is self-distillation: this must be the exact unquantized BF16 model
+  # from which model.pretrained_model_name_or_path was quantized. The launcher
+  # supplies and validates the concrete path.
+  teacher_model_name_or_path: /path/to/bf16-model-matching-student
 
-  # Flash samples only its four deployed transformer-evaluation timesteps.
+  # Flash samples only its deployed transformer-evaluation timesteps. By
+  # default all four are used; set a half-open inference step range to train a
+  # strict subset, e.g. [1,4) for the final three Flash calls.
   # Set schedule=qwen_image for full-range logit-normal/uniform QAD instead.
   timestep:
     schedule: qwen_image_flash
+    # num_inference_steps: 4
+    # inference_step_start: 1
+    # inference_step_end: 4
+    # For an original Qwen-Image student, a contiguous slice of its official
+    # inference trajectory can instead be sampled uniformly. Example for the
+    # first 5 of 50 denoising steps at 1024x1024:
+    # num_inference_steps: 50
+    # inference_step_start: 0
+    # inference_step_end: 5
+    # image_seq_len: 4096
+
+  # Optional calibrated quantized attention. The launcher supplies the recipe
+  # and the student-specific calib64 artifact only when explicitly enabled.
+  # Anchors are frozen, non-persistent buffers; gradients flow through the
+  # attention STE into the trainable transformer/SVDQuant GEMM parameters.
+  attention_grill:
+    enabled: false
+    recipe_path: null
+    calibration_path: null
+    ignore:
+      - transformer_blocks.0.attn
+      - transformer_blocks.1.attn
+      - transformer_blocks.58.attn
+      - transformer_blocks.59.attn
+    expected_replaced: 56
+    expected_ignored: 4
 
   # Final-output MSE remains an independent weight-1 objective component.
   output_loss:
@@ -50,8 +80,8 @@ qad:
   layerwise:
     enabled: true
     selection: quantized_blocks
-    # Cosine is scale-stable when an original Qwen teacher supervises a
-    # DMD2-trained Flash student. Weight 3 makes this group slightly dominant.
+    # Cosine is scale-stable for BF16-teacher versus quantized-student block
+    # outputs. Weight 3 makes this group slightly dominant.
     type: cosine
     weight: 3.0
     reduction: mean
@@ -64,7 +94,7 @@ qad:
 
   student:
     mode: nvfp4_svdquant
-    # all is canonical; lora_only trains only the SVDQuant HF PEFT A/B factors.
+    # all is canonical; lora_only trains only SVDQuant A/B and an optional magnitude delta.
     train_scope: all
 
 optim:
